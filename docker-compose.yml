@@ -1,0 +1,108 @@
+# Deployment stack: the published image plus a watcher that redeploys it.
+#
+#   docker compose up -d
+#
+# After that, a push to `main` is the whole deployment procedure: CI publishes a
+# new `:latest`, watchtower notices it within the poll interval, and recreates
+# the container with the same configuration. See README.md → Deployment.
+
+name: deeptag
+
+services:
+  deeptag:
+    image: ghcr.io/bestony/deeptag:latest
+    # Also survives a host reboot; `no` would leave the bot down until someone
+    # noticed. `unless-stopped` rather than `always` so a deliberate
+    # `docker compose stop` stays stopped.
+    restart: unless-stopped
+
+    env_file:
+      # Secrets and agent tuning: DEEPSEEK_API_KEY, LARK_APP_ID,
+      # LARK_APP_SECRET, LARK_DOMAIN, AGENT_MODEL, LOG_LEVEL, HISTORY_SCOPE…
+      # See .env.example. Optional, because the server starts without any of
+      # them — it just has no bot and no agent.
+      - path: .env
+        required: false
+
+    environment:
+      # Fixed for the container, and listed here rather than left to `.env`
+      # because `environment` wins over `env_file`. That matters: .env.example
+      # ships HOST=127.0.0.1, which is right for a dev machine and would leave
+      # the server unreachable from outside the container. The directory paths
+      # are pinned for the same reason — they are where the volumes below are
+      # mounted, and a stray value in .env would silently write state somewhere
+      # that is not persisted.
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+      DATA_DIR: /app/data
+      WORKSPACE_DIR: /app/workspace
+      SESSION_DIR: /app/sessions
+      MEMORY_DIR: /app/memory
+
+    ports:
+      # Host port only; the container always listens on 3000. Bind to
+      # 127.0.0.1 (DEEPTAG_BIND) when a reverse proxy fronts this.
+      - "${DEEPTAG_BIND:-0.0.0.0}:${DEEPTAG_PORT:-3000}:3000"
+
+    volumes:
+      # Read-only: the agent only ever reads AGENTS.md and MEMORY.md from here,
+      # and a bind mount is what makes them editable with an ordinary text
+      # editor on the host.
+      - ./data:/app/data:ro
+      # Named volumes, not bind mounts: the process runs as uid 1000 and a bind
+      # mount would arrive owned by root. Contents survive `down` and image
+      # updates; `docker compose down -v` is what throws them away.
+      - deeptag-workspace:/app/workspace
+      - deeptag-sessions:/app/sessions
+      - deeptag-memory:/app/memory
+
+    labels:
+      # Opts this container in to watchtower below, which is configured to leave
+      # everything else on the host alone.
+      com.centurylinklabs.watchtower.enable: "true"
+
+    # The image already declares a HEALTHCHECK against /health, so there is
+    # nothing to configure here; `docker compose ps` reports its result.
+
+    logging:
+      # One JSON object per log line, so an unbounded file is a real risk on a
+      # chatty bot.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  watchtower:
+    image: containrrr/watchtower:1.7.1
+    restart: unless-stopped
+
+    # NOTE: this is root on the host in every practical sense — anything that
+    # can talk to the Docker socket can start a privileged container. It is the
+    # price of pull-based deploys with no inbound access to the server. If that
+    # trade is not acceptable, drop this service and deploy by running
+    # `docker compose pull && docker compose up -d` over SSH instead.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    environment:
+      # Only containers carrying the label above are touched. Without this,
+      # watchtower would update every container on the host.
+      WATCHTOWER_LABEL_ENABLE: "true"
+      # Seconds between registry checks. GHCR is checked by digest, so this is
+      # a cheap request, not a full pull.
+      WATCHTOWER_POLL_INTERVAL: "${WATCHTOWER_POLL_INTERVAL:-300}"
+      # Removes the image the container was replaced from, or the host fills up
+      # with one dangling image per deploy.
+      WATCHTOWER_CLEANUP: "true"
+      TZ: "${TZ:-UTC}"
+      # Uncomment while the GHCR package is private: a GitHub username and a
+      # personal access token with `read:packages`. A public package needs
+      # neither — watchtower then pulls anonymously.
+      # REPO_USER: "${GHCR_USERNAME}"
+      # REPO_PASS: "${GHCR_TOKEN}"
+
+volumes:
+  deeptag-workspace:
+  deeptag-sessions:
+  deeptag-memory:

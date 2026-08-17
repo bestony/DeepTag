@@ -1,0 +1,14 @@
+# Build context: an allowlist, not a deny list.
+#
+# Everything is excluded and the few files the image actually needs are added
+# back. Built the other way round, forgetting one pattern would ship `.env`, the
+# conversation transcripts in sessions/, or whatever the agent wrote into
+# workspace/ into a public image — so the default has to be "not included".
+
+*
+
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!tsconfig.json
+!src

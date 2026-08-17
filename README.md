@@ -406,6 +406,120 @@ read before any value is used.
 
 Logs are emitted as one JSON object per line.
 
+## Deployment
+
+Images are published to the GitHub Container Registry by
+[`.github/workflows/docker-publish.yml`](./.github/workflows/docker-publish.yml)
+on every push to `main` and `dev` and on every `v*` tag:
+
+```
+ghcr.io/bestony/deeptag:latest    # default branch
+ghcr.io/bestony/deeptag:dev       # dev branch
+ghcr.io/bestony/deeptag:1.2.3     # from tag v1.2.3
+ghcr.io/bestony/deeptag:sha-<sha> # any build, immutable
+```
+
+Both `linux/amd64` and `linux/arm64` are built. Pull requests build the image
+too but stop before the push, so a broken `Dockerfile` or a type error is caught
+without publishing anything — the build runs `tsc`, which is the same check the
+`pre-commit` hook runs.
+
+The registry package starts out private. Make it public under
+**Packages → deeptag → Package settings → Change visibility**, or leave it
+private and give the deploying host a token with `read:packages`.
+
+### Running the stack
+
+[`docker-compose.yml`](./docker-compose.yml) is the deployment unit: the
+published image plus a [watchtower](https://containrrr.dev/watchtower/) that
+polls GHCR and recreates the container when the tag it is running moves.
+
+```sh
+git clone https://github.com/bestony/DeepTag.git && cd DeepTag
+cp .env.example .env    # fill in DEEPSEEK_API_KEY and the Lark credentials
+mkdir -p data           # optional: AGENTS.md and MEMORY.md go here
+docker compose up -d
+docker compose logs -f deeptag
+```
+
+After that, deploying is `git push`: CI publishes a new `:latest`, watchtower
+notices within `WATCHTOWER_POLL_INTERVAL` (300s by default) and restarts the
+container against the same volumes and environment. Nothing needs to reach the
+server from outside.
+
+`docker compose pull && docker compose up -d` forces an update immediately,
+which is also the whole procedure if you would rather drop the watchtower
+service — it holds the Docker socket, which on a single-tenant host is
+equivalent to root, and that is a real trade for not having to open inbound SSH.
+
+Only the source files, the manifests and `tsconfig.json` reach the build
+context; [`.dockerignore`](./.dockerignore) is an allowlist so that `.env`, the
+transcripts under `sessions/` and whatever the agent wrote into `workspace/`
+cannot end up in a published image.
+
+| Compose variable          | Default   | Description                                              |
+| ------------------------- | --------- | -------------------------------------------------------- |
+| `DEEPTAG_PORT`            | `3000`    | Host port mapped to the container's 3000                 |
+| `DEEPTAG_BIND`            | `0.0.0.0` | Host interface to publish on; `127.0.0.1` behind a proxy  |
+| `WATCHTOWER_POLL_INTERVAL`| `300`     | Seconds between registry checks                          |
+| `TZ`                      | `UTC`     | Timezone for the watchtower container                    |
+
+### What the container fixes
+
+The compose file sets these in `environment:`, which overrides `env_file:`, so a
+value in `.env` cannot change them:
+
+| Variable | Value in the container | Why |
+| -------- | ---------------------- | --- |
+| `HOST` | `0.0.0.0` | The `127.0.0.1` default is right on a laptop and unreachable in a container |
+| `PORT` | `3000` | Publish a different port on the host instead |
+| `NODE_ENV` | `production` | Also narrows the default log level to `info` |
+| `DATA_DIR` | `/app/data` | Bind-mounted read-only from `./data`; the agent only reads it |
+| `WORKSPACE_DIR` | `/app/workspace` | Named volume `deeptag-workspace` |
+| `SESSION_DIR` | `/app/sessions` | Named volume `deeptag-sessions` |
+| `MEMORY_DIR` | `/app/memory` | Named volume `deeptag-memory` |
+
+The three writable directories are named volumes rather than bind mounts because
+the process runs as the unprivileged `node` user (uid 1000) and a bind mount
+would arrive owned by root. They survive `docker compose down` and every image
+update; `docker compose down -v` is what deletes them, and it deletes every
+transcript and everything the agent remembers along with it.
+
+Everything else — `DEEPSEEK_API_KEY`, the Lark credentials, `LOG_LEVEL`,
+`HISTORY_SCOPE`, `AGENT_MODEL`, `AGENT_SYSTEM_PROMPT`, `AGENT_TIMEOUT_MS` —
+comes from `.env` as usual.
+
+### Notes on the image
+
+- PID 1 is `tini`. The agent's bash tool spawns process trees, and without a
+  real init every finished command would be left behind as a zombie.
+- `bash` is present, which is what the agent tool looks for before falling back
+  to plain `sh`.
+- `HEALTHCHECK` polls `/health` using Node's global `fetch`, so `docker compose
+  ps` reports whether the server is actually answering.
+- The build stage is pinned to `$BUILDPLATFORM`: the output is plain JavaScript
+  and no dependency ships a native binding, so the `arm64` image is cross-built
+  without running `pnpm install` and `tsc` under emulation.
+- The base is Node 24 (LTS), overridable with `--build-arg NODE_VERSION=…`, or
+  entirely with `--build-arg NODE_IMAGE=…` to build from a registry mirror.
+
+### Building it yourself
+
+```sh
+docker build -t deeptag .
+docker run --rm -p 3000:3000 --env-file .env -e HOST=0.0.0.0 deeptag
+
+# From a mirror, where Docker Hub is slow or unreachable:
+docker build -t deeptag \
+  --build-arg NODE_IMAGE=docker.m.daocloud.io/library/node:24-bookworm-slim .
+```
+
+Verify a published image came out of this repository:
+
+```sh
+gh attestation verify oci://ghcr.io/bestony/deeptag:latest --repo bestony/DeepTag
+```
+
 ## Development
 
 Git hooks are managed by [lefthook](https://lefthook.dev) and installed by
