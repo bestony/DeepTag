@@ -1,14 +1,11 @@
 /**
  * Minimal leveled logger emitting one JSON object per line.
  *
- * The level is resolved once from `LOG_LEVEL` so production can be narrowed to
- * the essential lines while local runs keep the detail needed for debugging.
- * Defaults: `info` when NODE_ENV=production, `debug` otherwise.
+ * The active level comes from `config` (see LOG_LEVEL), so production can be
+ * narrowed to the essential lines while local runs keep debugging detail.
  */
 
-export const LOG_LEVELS = ["debug", "info", "warn", "error", "silent"] as const;
-
-export type LogLevel = (typeof LOG_LEVELS)[number];
+import { config, type LogLevel } from "./config.ts";
 
 /** Levels below the configured one are dropped; `silent` drops everything. */
 const LEVEL_RANK: Record<LogLevel, number> = {
@@ -21,25 +18,7 @@ const LEVEL_RANK: Record<LogLevel, number> = {
 
 export type LogContext = Record<string, unknown>;
 
-const isLogLevel = (value: string): value is LogLevel =>
-  (LOG_LEVELS as readonly string[]).includes(value);
-
-const resolveLevel = (): LogLevel => {
-  const raw = process.env["LOG_LEVEL"]?.trim().toLowerCase();
-  if (raw === undefined || raw === "") {
-    return process.env["NODE_ENV"] === "production" ? "info" : "debug";
-  }
-  if (isLogLevel(raw)) {
-    return raw;
-  }
-  // Surface the misconfiguration instead of silently ignoring it.
-  console.warn(
-    `[logger] unknown LOG_LEVEL "${raw}", expected one of ${LOG_LEVELS.join(", ")}; falling back to "info"`,
-  );
-  return "info";
-};
-
-const currentLevel = resolveLevel();
+const currentLevel = config.logLevel;
 
 type EmittableLevel = Exclude<LogLevel, "silent">;
 

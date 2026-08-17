@@ -6,6 +6,7 @@ Deepseek implement of Claude Tag
 
 ```sh
 pnpm install
+cp .env.example .env   # optional; every variable has a default
 pnpm dev
 ```
 
@@ -35,14 +36,24 @@ curl http://127.0.0.1:3000/health
 
 ### Configuration
 
-All environment variables are optional.
+On startup the server loads a `.env` file from the project root via `dotenv`.
+See [`.env.example`](./.env.example) for the full list. Variables already set in
+the real environment take precedence over the file, so a deployment's
+configuration is never shadowed by a stray `.env`; a missing `.env` is fine and
+every variable is optional.
 
-| Variable    | Default                        | Description                                            |
-| ----------- | ------------------------------ | ------------------------------------------------------ |
-| `PORT`      | `3000`                         | Listening port                                         |
-| `HOST`      | `127.0.0.1`                    | Bind address; set `0.0.0.0` in containers              |
-| `LOG_LEVEL` | `debug` (`info` in production) | One of `debug`, `info`, `warn`, `error`, `silent`      |
-| `NODE_ENV`  | –                              | `production` narrows the default log level to `info`   |
+| Variable    | Default                        | Description                                          |
+| ----------- | ------------------------------ | ---------------------------------------------------- |
+| `PORT`      | `3000`                         | Listening port                                       |
+| `HOST`      | `127.0.0.1`                    | Bind address; set `0.0.0.0` in containers            |
+| `LOG_LEVEL` | `debug` (`info` in production) | One of `debug`, `info`, `warn`, `error`, `silent`    |
+| `NODE_ENV`  | `development`                  | `production` narrows the default log level to `info` |
+
+Invalid values are reported as a `configuration problem` warning and fall back
+to the default rather than aborting startup. All parsing lives in
+`src/config.ts`, which is the only module that reads `process.env`: it loads
+`.env` during its own evaluation, so importing it is what guarantees the file is
+read before any value is used.
 
 Logs are emitted as one JSON object per line.
 
