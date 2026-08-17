@@ -63,6 +63,25 @@ const describeError = (err: unknown): string =>
   err instanceof Error ? err.message : String(err);
 
 /**
+ * Makes one message safe to store.
+ *
+ * The session store rejects any payload holding an own property whose value is
+ * `undefined`, and the agent loop produces exactly that: a `toolResult` carries
+ * `details` and `usage` as explicit `undefined` whenever the tool returned
+ * neither. Appending it throws, and since a turn is appended in order, it takes
+ * every message behind it with it — which is how a transcript ends up holding a
+ * question and the assistant's first tool call and nothing else, for every turn
+ * that used a tool.
+ *
+ * A JSON round-trip drops those properties. It is deliberately the whole shape
+ * rather than the two fields that happen to break today: what survives the
+ * round-trip is, by definition, what the store can hold and what would be read
+ * back off disk anyway.
+ */
+const durable = (message: AgentMessage): AgentMessage =>
+  JSON.parse(JSON.stringify(message)) as AgentMessage;
+
+/**
  * Restores the tail of the conversation.
  *
  * Only the last `limit` messages are read, because that is all `runner.ts`
@@ -134,15 +153,23 @@ export const createTranscriptStore = (root: string): TranscriptStore => {
       append: async (produced) => {
         // Sequentially: the storage layer queues writes anyway, and appending
         // in order is what makes the file replayable.
+        let written = 0;
         try {
           for (const message of produced) {
-            await session.appendMessage(message);
+            await session.appendMessage(durable(message));
+            written += 1;
           }
         } catch (err) {
-          logger.error("transcript append failed, those messages are lost", {
+          // The rest of the turn is abandoned on purpose. Skipping the bad
+          // message and carrying on would leave a hole, and a `toolResult`
+          // whose assistant message is missing is an orphan the provider
+          // rejects on the next restore — a worse failure than a short turn.
+          logger.error("transcript append failed, the rest of this turn is lost", {
             chatId,
             cwd,
             messages: produced.length,
+            written,
+            failedRole: produced[written]?.role,
             error: describeError(err),
           });
         }
