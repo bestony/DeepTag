@@ -14,9 +14,21 @@
  * tooling already understands, and leaves the door open to adopting
  * `AgentHarness` later without migrating anything.
  *
- * Only a slice of that format is used: messages appended to the `main` lane.
- * Branching, forking, compaction records and usage accounting are all things
- * the harness writes and we do not.
+ * Only a slice of that format is used: messages appended to the `main` lane,
+ * plus one custom `speaker` entry per turn (below). Branching, forking,
+ * compaction records and usage accounting are all things the harness writes and
+ * we do not.
+ *
+ * ## Who said it
+ *
+ * A `user` message carries no identity of its own, and in a group the speaker
+ * changes from message to message — so a transcript read back later cannot say
+ * who wrote what. Each turn is therefore preceded by a `speaker` entry naming
+ * the sender's Lark `open_id`, which is what makes `history.ts` able to report
+ * a group conversation rather than an anonymous one. It is a separate entry
+ * rather than a prefix on the message so the text the model sees is untouched,
+ * and restoring filters by entry type, so these are invisible to the resumed
+ * conversation.
  *
  * Nothing here throws. A transcript that cannot be read or written costs the
  * conversation its memory, which is bad; it must not cost the user their reply,
@@ -33,13 +45,23 @@ import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 
 import { logger } from "../logger.ts";
 
+/**
+ * `customType` of the entry that names the sender of the turn that follows.
+ * Written here, read by `history.ts`.
+ */
+export const SPEAKER_ENTRY_TYPE = "speaker";
+
 export type ChatTranscript = {
   /** Messages restored from disk, oldest first; empty for a new chat. */
   readonly messages: readonly AgentMessage[];
   /** True when this chat had a transcript already — it is being resumed, not started. */
   readonly resumed: boolean;
-  /** Appends the messages one run produced. Never rejects. */
-  append(messages: readonly AgentMessage[]): Promise<void>;
+  /**
+   * Appends the messages one run produced, attributed to `speaker` — the Lark
+   * `open_id` of whoever sent the message, or null when the event carried none.
+   * Never rejects.
+   */
+  append(messages: readonly AgentMessage[], speaker: string | null): Promise<void>;
 };
 
 export type TranscriptStore = {
@@ -88,6 +110,10 @@ const durable = (message: AgentMessage): AgentMessage =>
  * would send to the model anyway — the rest stays on disk as the record. A
  * transcript that begins with a `toolResult` is trimmed further: without the
  * assistant message that requested it, it is an orphan the provider rejects.
+ *
+ * Filtering on `type: "message"` is also what keeps the `speaker` entries out
+ * of the resumed conversation: the branch is walked in full and only messages
+ * are collected, so `limit` still counts messages and nothing else.
  */
 const restoreMessages = async (
   session: Session<JsonlSessionMetadata>,
@@ -150,11 +176,19 @@ export const createTranscriptStore = (root: string): TranscriptStore => {
     return {
       messages,
       resumed,
-      append: async (produced) => {
+      append: async (produced, speaker) => {
+        if (produced.length === 0) {
+          return;
+        }
         // Sequentially: the storage layer queues writes anyway, and appending
         // in order is what makes the file replayable.
         let written = 0;
         try {
+          // Ahead of the messages, so a reader walking the log forward knows
+          // who the user message that follows belongs to. Written on every
+          // turn, including an unattributed one, so the previous speaker
+          // cannot bleed into the next.
+          await session.appendCustomEntry(SPEAKER_ENTRY_TYPE, { openId: speaker });
           for (const message of produced) {
             await session.appendMessage(durable(message));
             written += 1;

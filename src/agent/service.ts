@@ -6,8 +6,10 @@
  * "not configured" outcomes.
  */
 
-import { config } from "../config.ts";
+import { config, type HistoryScope } from "../config.ts";
 import { logger } from "../logger.ts";
+import { createChatDirectory } from "./directory.ts";
+import { createHistoryStore } from "./history.ts";
 import { loadInstructions } from "./instructions.ts";
 import { createMemoryStore } from "./memory.ts";
 import { PROVIDER_ID, resolveModel } from "./model.ts";
@@ -34,6 +36,12 @@ export type AgentStatus =
        * and in the startup log.
        */
       readonly workspaceReady: boolean;
+      /**
+       * How far the history tools may read across chats. Reported because it
+       * is a confidentiality setting, and "which one is this deployment on?"
+       * should be answerable without reading the environment off the host.
+       */
+      readonly historyScope: HistoryScope;
     };
 
 /** `undefined` = not resolved yet, `null` = resolution attempted and failed. */
@@ -89,14 +97,21 @@ export const initAgent = (): void => {
   // first written, so there is nothing to prepare or verify at startup.
   const transcripts = createTranscriptStore(config.sessionDir);
   const memory = createMemoryStore(config.memoryDir);
+  // Both read the same root as the transcripts: the directory says which chat
+  // each transcript belongs to, and the history store reads them back under
+  // the configured scope.
+  const directory = createChatDirectory(config.sessionDir);
+  const history = createHistoryStore(config.sessionDir, directory, config.historyScope);
 
-  runner = createAgentRunner(
-    { ...agentConfig, systemPrompt: instructions.systemPrompt },
-    resolution.binding,
+  runner = createAgentRunner({
+    agentConfig: { ...agentConfig, systemPrompt: instructions.systemPrompt },
+    binding: resolution.binding,
     workspaces,
     transcripts,
     memory,
-  );
+    directory,
+    history,
+  });
   logger.info("agent ready", {
     provider: PROVIDER_ID,
     model: resolution.binding.model.id,
@@ -107,6 +122,8 @@ export const initAgent = (): void => {
     workspaceRoot: config.workspace.root,
     workspaceReady,
     sessionDir: config.sessionDir,
+    chatDirectory: directory.path,
+    historyScope: config.historyScope,
     memoryDir: config.memoryDir,
   });
 };
@@ -121,6 +138,7 @@ export const getAgentStatus = (): AgentStatus => {
     sessions: runner.sessionCount(),
     instructionFiles,
     workspaceReady,
+    historyScope: config.historyScope,
   };
 };
 

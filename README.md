@@ -34,7 +34,8 @@ curl http://127.0.0.1:3000/health
 # {"status":"ok","service":"deeptag","uptime":12.34,"timestamp":"...",
 #  "lark":{"enabled":true,"state":"connected","reconnectAttempts":0},
 #  "agent":{"enabled":true,"model":"deepseek-v4-flash","sessions":0,
-#           "instructionFiles":["AGENTS.md"],"workspaceReady":true}}
+#           "instructionFiles":["AGENTS.md"],"workspaceReady":true,
+#           "historyScope":"shared-groups"}}
 ```
 
 `lark.state` is reported but deliberately kept out of `status`: a degraded bot
@@ -91,6 +92,9 @@ Set `DEEPSEEK_API_KEY` to enable it; `AGENT_MODEL` defaults to
 | `src/agent/memory-tools.ts` | The `remember` and `recall` tools                       |
 | `src/agent/distill.ts`      | Post-turn extraction of what is worth remembering       |
 | `src/agent/transcript.ts`   | Persisted transcripts, so a chat resumes after restart  |
+| `src/agent/directory.ts`    | Which chat each transcript belongs to                   |
+| `src/agent/history.ts`      | Reading chats back, and who may read which              |
+| `src/agent/history-tools.ts`| The `list_chats` and `read_chat` tools                  |
 | `src/agent/runner.ts`       | Per-chat sessions, serialization, timeouts, pruning     |
 | `src/agent/service.ts`      | The app-wide instance wired from configuration          |
 
@@ -116,7 +120,8 @@ from disk on its next message. The third bounds what is *sent*, not what is
 Different chats still run concurrently.
 
 **Tools.** Each session gets `read`, `write`, `edit` and `bash`, bound to that
-chat's workspace, plus `remember` and `recall` — see below.
+chat's workspace, plus `remember` and `recall` for memory and `list_chats` and
+`read_chat` for the other conversations — all three groups below.
 
 ### Memory about people and chats
 
@@ -191,13 +196,26 @@ a slice of it is written — messages — while branching, compaction records an
 usage accounting are things the harness writes and DeepTag does not.
 
 Transcripts are keyed by the chat's workspace directory, which is the `cwd` the
-format indexes on:
+format indexes on, and `chats.jsonl` beside them says which chat that is:
 
 ```
 sessions/                              # SESSION_DIR
+├── chats.jsonl                        # chat_id → workspace, and chat type
 └── --path-to-workspace-oc_9a3f1c...--/
     └── 2026-08-17T03-18-15-929Z_01a00dba-....jsonl
 ```
+
+That second file exists because the directory name is `safeName(chat_id)` —
+lossy and hashed, so it cannot be read backwards — while reading a chat's
+history needs both the id and whether the chat is a group, which no transcript
+records. It is appended to when a chat's session opens and only when something
+changed, so it grows with the number of chats rather than with traffic.
+
+Each turn is preceded by a `speaker` entry naming the sender's `open_id`. A
+`user` message carries no identity of its own, so without it a group transcript
+read back later cannot say who wrote what. It is a separate entry rather than a
+prefix on the text, so what the model sees is untouched, and restoring filters
+on entry type, so it never re-enters the conversation.
 
 On restore only the last 60 messages are loaded, since that is all a turn would
 send anyway; the rest stays on disk as the record. A restored transcript that
@@ -207,12 +225,63 @@ message that requested it, the provider rejects it as an orphan.
 Everything a run produces is persisted, including on failure, so the file
 mirrors the transcript in memory. A turn that errored therefore leaves an empty
 assistant message in the history; it is resent until it scrolls out of the
-60-message window.
+60-message window. Messages are JSON round-tripped on the way in, because the
+store rejects a payload holding an explicit `undefined` and the agent loop
+produces one on every `toolResult` — left alone, that throws and takes the rest
+of the turn with it.
 
 Nothing here is fatal: a transcript that cannot be read or written costs the
 conversation its memory, logged as an error, and the user still gets their
-reply. Nothing is ever deleted either, so growth on disk is yours to manage —
-and note that these files hold whatever users said to the bot.
+reply. A message that cannot be stored ends that turn's persistence rather than
+being skipped, because a `toolResult` whose assistant message went missing is an
+orphan the provider rejects on the next restore. Nothing is ever deleted either,
+so growth on disk is yours to manage — and note that these files hold whatever
+users said to the bot.
+
+### Reading other chats
+
+`list_chats` and `read_chat` let a conversation see the others. Memory carries
+the distilled facts between chats; this carries the conversation itself,
+including the parts nobody thought to distil, and reaches past the 60 messages
+a turn resends:
+
+| Tool         | Answers                                                          |
+| ------------ | ---------------------------------------------------------------- |
+| `list_chats` | which chats there are, when each was last active, what was last said in it — and, with a query, which of them mention a topic |
+| `read_chat`  | that chat's messages, oldest first; with a query, only the matching ones. Omit the id to page back through the current chat |
+
+A read renders one line per message, `[time] open_id: text`, with the sender
+spelled out in full because that is what `remember` and `recall` take. Tool
+traffic collapses to the names used — replaying another chat's shell output
+would be noise at best and a second copy of whatever it printed at worst. One
+result is capped at 8000 characters, oldest lines dropped first.
+
+**Visibility** mirrors the memory rules, because it is the same exposure and two
+different answers to it would be a bug waiting to happen. `HISTORY_SCOPE`
+chooses which rule applies:
+
+| Scope                     | A chat can read                                                      |
+| ------------------------- | -------------------------------------------------------------------- |
+| `shared-groups` (default) | its own history, plus any **group** chat's — private chats stay private |
+| `own-chat`                | only its own history                                                 |
+
+Chats with no `chats.jsonl` entry are invisible rather than assumed public:
+without a record there is no chat type, and a rule that cannot be evaluated has
+to fail closed. This is also what a transcript written before this feature
+existed looks like — it becomes visible the next time that chat gets a message.
+An id that is not visible is answered exactly like an id that does not exist,
+since which of the two it is, is itself information.
+
+Read `shared-groups` carefully before deploying it: **anyone who can message the
+bot privately can read back every group transcript it holds.** That is the
+behaviour of a colleague who is in both rooms, which is the point, but it is a
+real exposure — `own-chat` turns it off, and an unrecognized `HISTORY_SCOPE`
+falls back to `own-chat` rather than to the default, so a typo cannot widen it.
+
+Transcripts are read by hand here rather than through the session library, for
+one specific reason: loading a session *repairs* a torn tail by rewriting the
+file, and these files are being appended to by live sessions. A read must never
+be able to truncate a transcript another chat is still writing.
 
 ### Workspace
 
@@ -319,6 +388,7 @@ every variable is optional.
 | `DATA_DIR`  | `./data`                       | Holds `AGENTS.md` and `MEMORY.md`; need not exist    |
 | `WORKSPACE_DIR` | `./workspace`              | Root of the per-chat workspaces; created at startup  |
 | `SESSION_DIR` | `./sessions`                 | Persisted transcripts, one per chat; created on demand |
+| `HISTORY_SCOPE` | `shared-groups`            | `shared-groups` or `own-chat`; how far `read_chat` may read |
 | `MEMORY_DIR` | `./memory`                    | Memory about people and chats; created on demand      |
 | `LARK_APP_ID` | –                            | Lark app id; must be set together with the secret    |
 | `LARK_APP_SECRET` | –                        | Lark app secret; unset disables the bot              |

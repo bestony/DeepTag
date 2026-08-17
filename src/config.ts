@@ -23,6 +23,18 @@ export const LARK_DOMAINS = ["feishu", "lark"] as const;
 
 export type LarkDomain = (typeof LARK_DOMAINS)[number];
 
+/**
+ * How far the history tools may read. See `src/agent/history.ts` — the rule is
+ * enforced there, and this only chooses which of the two applies.
+ *
+ * - `shared-groups`: a group chat's transcript is readable from any chat, a
+ *   private one only from itself. Mirrors how recorded memory already travels.
+ * - `own-chat`: every chat sees only its own history.
+ */
+export const HISTORY_SCOPES = ["shared-groups", "own-chat"] as const;
+
+export type HistoryScope = (typeof HISTORY_SCOPES)[number];
+
 export type LarkConfig = {
   readonly appId: string;
   readonly appSecret: string;
@@ -66,10 +78,13 @@ export type AppConfig = {
   readonly workspace: WorkspaceConfig;
   /**
    * Absolute root of the persisted session transcripts, one JSONL file per
-   * chat. Kept away from the workspace on purpose: the agent must not be able
-   * to rewrite the record of what it was asked to do.
+   * chat, plus the chat directory that says which chat each one belongs to.
+   * Kept away from the workspace on purpose: the agent must not be able to
+   * rewrite the record of what it was asked to do.
    */
   readonly sessionDir: string;
+  /** Which transcripts the history tools may read back; see HISTORY_SCOPES. */
+  readonly historyScope: HistoryScope;
   /**
    * Absolute root of what the agent remembers about people and chats, one
    * JSONL file per subject. Kept away from the workspace for the same reason
@@ -206,6 +221,29 @@ const resolveLogLevel = (nodeEnv: string): LogLevel => {
   return "info";
 };
 
+const isHistoryScope = (value: string): value is HistoryScope =>
+  (HISTORY_SCOPES as readonly string[]).includes(value);
+
+/**
+ * Falls back to the *narrower* of the two on a bad value. Every other fallback
+ * in this file restores the documented default; this one does not, because
+ * getting it wrong the other way would widen who can read a transcript on the
+ * strength of a typo.
+ */
+const resolveHistoryScope = (): HistoryScope => {
+  const raw = read("HISTORY_SCOPE")?.toLowerCase();
+  if (raw === undefined) {
+    return "shared-groups";
+  }
+  if (isHistoryScope(raw)) {
+    return raw;
+  }
+  configWarnings.push(
+    `unknown HISTORY_SCOPE "${raw}", expected one of ${HISTORY_SCOPES.join(", ")}; falling back to "own-chat", which is the restrictive one`,
+  );
+  return "own-chat";
+};
+
 const isLarkDomain = (value: string): value is LarkDomain =>
   (LARK_DOMAINS as readonly string[]).includes(value);
 
@@ -331,6 +369,7 @@ export const config: AppConfig = {
   dataDir,
   workspace: { root: workspaceRoot, shellEnv: resolveShellEnv() },
   sessionDir,
+  historyScope: resolveHistoryScope(),
   memoryDir,
   lark: resolveLark(),
   agent: resolveAgent(),

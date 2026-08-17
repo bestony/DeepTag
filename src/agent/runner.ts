@@ -20,17 +20,24 @@
  * is what "the agent starts in its workspace" means in practice: no session
  * exists without one, and no tool can be called before the directory is there.
  *
- * The runner takes its model binding, workspace provider and transcript store
- * as arguments rather than reading config, so it can be exercised against a
- * faux provider and a temporary directory. `service.ts` wires the
- * application-wide instance.
+ * Opening a session is also when the chat is written to the chat directory
+ * (`directory.ts`), which is what makes it visible to the history tools at all.
+ * It happens here rather than in the transcript store because this is the only
+ * layer that holds both the chat's identity and its workspace.
+ *
+ * The runner takes its collaborators as arguments rather than reading config,
+ * so it can be exercised against a faux provider and temporary directories.
+ * `service.ts` wires the application-wide instance.
  */
 
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 
 import type { AgentConfig } from "../config.ts";
 import { logger } from "../logger.ts";
+import type { ChatDirectory } from "./directory.ts";
 import { distillTurn } from "./distill.ts";
+import { createHistoryTools } from "./history-tools.ts";
+import type { HistoryStore } from "./history.ts";
 import {
   groupSubject,
   renderMemoryBlock,
@@ -74,6 +81,21 @@ export type AgentRunner = {
   sessionCount(): number;
   /** Aborts in-flight runs and drops all sessions. */
   clear(): void;
+};
+
+/**
+ * Everything a runner works through. An object rather than a parameter list:
+ * they are all peers with no meaningful order, and each one is a seam a test
+ * can substitute at.
+ */
+export type AgentRunnerDeps = {
+  readonly agentConfig: AgentConfig;
+  readonly binding: ModelBinding;
+  readonly workspaces: WorkspaceProvider;
+  readonly transcripts: TranscriptStore;
+  readonly memory: MemoryStore;
+  readonly directory: ChatDirectory;
+  readonly history: HistoryStore;
 };
 
 /** A chat's live session: created once, reused by every run for that chat. */
@@ -138,13 +160,8 @@ const extractText = (message: AgentMessage): string => {
     .trim();
 };
 
-export const createAgentRunner = (
-  agentConfig: AgentConfig,
-  binding: ModelBinding,
-  workspaces: WorkspaceProvider,
-  transcripts: TranscriptStore,
-  memory: MemoryStore,
-): AgentRunner => {
+export const createAgentRunner = (deps: AgentRunnerDeps): AgentRunner => {
+  const { agentConfig, binding, workspaces, transcripts, memory, directory, history } = deps;
   const slots = new Map<string, Slot>();
 
   /**
@@ -193,8 +210,13 @@ export const createAgentRunner = (
     // Opened before the Agent exists, so the directory is on disk before the
     // model can be told about it, let alone call a tool against it.
     const workspace = workspaces.open(chatId);
-    // Keyed on the workspace directory, which is this chat's stable identity.
-    const transcript = await transcripts.open(chatId, workspace.dir, MAX_HISTORY_MESSAGES);
+    // Keyed on the workspace directory, which is this chat's stable identity —
+    // and recorded in the chat directory under the same key, so this chat's own
+    // history tools can find their transcript on their very first call.
+    const [transcript] = await Promise.all([
+      transcripts.open(chatId, workspace.dir, MAX_HISTORY_MESSAGES),
+      directory.record({ chatId, chatType: request.chatType, cwd: workspace.dir }),
+    ]);
 
     // The workspace block goes after the instructions: it describes where this
     // session is running, which is the most concrete and least general thing
@@ -212,7 +234,11 @@ export const createAgentRunner = (
         // memory of whoever is speaking. This is only the starting value.
         systemPrompt: basePrompt,
         model: binding.model,
-        tools: [...workspace.tools, ...createMemoryTools(memory, () => turn)],
+        tools: [
+          ...workspace.tools,
+          ...createMemoryTools(memory, () => turn),
+          ...createHistoryTools(history, () => turn),
+        ],
         // What makes this a resumed conversation rather than a new one.
         messages: [...transcript.messages],
       },
@@ -346,7 +372,7 @@ export const createAgentRunner = (
     // mirror the transcript in memory, and a turn that failed halfway is still
     // part of the conversation. Awaited rather than fired and forgotten, so a
     // crash just after the reply cannot lose the exchange it was replying to.
-    await session.transcript.append(produced);
+    await session.transcript.append(produced, request.senderOpenId);
 
     if (failure !== undefined) {
       logger.error("agent run threw", {
