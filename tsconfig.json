@@ -28,7 +28,12 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
 
-    /* Module hygiene: keep sources runnable by any type-stripping runtime */
+    /* Module hygiene: keep sources runnable by any type-stripping runtime.
+       Node.js resolves relative ESM specifiers literally, so sources import
+       "./x.ts"; rewriteRelativeImportExtensions turns those into "./x.js" on
+       emit so the compiled output in dist/ stays valid. */
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
     "erasableSyntaxOnly": true,
