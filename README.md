@@ -24,15 +24,17 @@ can strip.
 
 ### Endpoints
 
-| Method | Path      | Description                                                   |
-| ------ | --------- | ------------------------------------------------------------- |
-| `GET`  | `/`       | Returns `Hono!`                                               |
-| `GET`  | `/health` | Health check: status, service, uptime, timestamp, Lark state  |
+| Method | Path      | Description                                                          |
+| ------ | --------- | -------------------------------------------------------------------- |
+| `GET`  | `/`       | Returns `Hono!`                                                      |
+| `GET`  | `/health` | Health check: status, service, uptime, timestamp, Lark and agent state |
 
 ```sh
 curl http://127.0.0.1:3000/health
 # {"status":"ok","service":"deeptag","uptime":12.34,"timestamp":"...",
-#  "lark":{"enabled":true,"state":"connected","reconnectAttempts":0}}
+#  "lark":{"enabled":true,"state":"connected","reconnectAttempts":0},
+#  "agent":{"enabled":true,"model":"deepseek-v4-flash","sessions":0,
+#           "instructionFiles":["AGENTS.md"]}}
 ```
 
 `lark.state` is reported but deliberately kept out of `status`: a degraded bot
@@ -80,11 +82,12 @@ running on DeepSeek's official API through
 Set `DEEPSEEK_API_KEY` to enable it; `AGENT_MODEL` defaults to
 `deepseek-v4-flash`.
 
-| Module                 | Responsibility                                          |
-| ---------------------- | ------------------------------------------------------- |
-| `src/agent/model.ts`   | Registers the DeepSeek provider and resolves the model  |
-| `src/agent/runner.ts`  | Per-chat sessions, serialization, timeouts, pruning     |
-| `src/agent/service.ts` | The app-wide instance wired from configuration          |
+| Module                      | Responsibility                                          |
+| --------------------------- | ------------------------------------------------------- |
+| `src/agent/model.ts`        | Registers the DeepSeek provider and resolves the model  |
+| `src/agent/instructions.ts` | Builds the system prompt from `DATA_DIR`                |
+| `src/agent/runner.ts`       | Per-chat sessions, serialization, timeouts, pruning     |
+| `src/agent/service.ts`      | The app-wide instance wired from configuration          |
 
 pi-ai ships catalogs for many providers, but only DeepSeek is registered: a
 smaller catalog means a smaller failure surface and no unrelated provider SDKs
@@ -106,6 +109,48 @@ Different chats still run concurrently.
 **Tools.** None are registered yet. `pi-agent-core` supports tool calling, and
 tools belong in the `initialState.tools` array in `src/agent/runner.ts`.
 
+### System prompt and the data directory
+
+`DATA_DIR` (default `./data`) holds the operator-editable state that shapes the
+agent. When the agent starts, two files are read from it and appended to the
+base prompt — the one from `AGENT_SYSTEM_PROMPT`, or the built-in default:
+
+| File        | Tag in the prompt     | Purpose                                    |
+| ----------- | --------------------- | ------------------------------------------ |
+| `AGENTS.md` | `<agent_instructions>` | Durable, operator-authored instructions    |
+| `MEMORY.md` | `<agent_memory>`      | Facts carried across conversations         |
+
+```
+data/
+├── AGENTS.md   # optional
+└── MEMORY.md   # optional
+```
+
+Both files are optional, and missing and empty are treated identically: such a
+file contributes **nothing** — no header, no placeholder — so with neither
+present the agent sees exactly the base prompt. That is the state of a fresh
+clone, and the directory itself need not exist.
+
+Contents are wrapped in XML-style tags rather than markdown headings, because
+the files are markdown themselves and may open with `# ...`, which would blur
+the boundary between prompt and content.
+
+Files are read once, while the agent is built at startup, and every chat session
+shares the result — so edits take effect on the next restart, not mid-run.
+`GET /health` reports which files made it in:
+
+```sh
+curl -s http://127.0.0.1:3000/health | jq .agent
+# {"enabled":true,"model":"deepseek-v4-flash","sessions":0,
+#  "instructionFiles":["AGENTS.md"]}
+```
+
+An unreadable file (bad permissions, a directory where a file was expected) is
+logged as a warning and skipped: a broken data directory should not stop the bot
+from answering. Because `MEMORY.md` can accumulate whatever a conversation
+mentions, treat the data directory as private and keep it out of version control
+if you point it at anything a deployment writes to.
+
 ### Configuration
 
 On startup the server loads a `.env` file from the project root via `dotenv`.
@@ -120,6 +165,7 @@ every variable is optional.
 | `HOST`      | `127.0.0.1`                    | Bind address; set `0.0.0.0` in containers            |
 | `LOG_LEVEL` | `debug` (`info` in production) | One of `debug`, `info`, `warn`, `error`, `silent`    |
 | `NODE_ENV`  | `development`                  | `production` narrows the default log level to `info` |
+| `DATA_DIR`  | `./data`                       | Holds `AGENTS.md` and `MEMORY.md`; need not exist    |
 | `LARK_APP_ID` | –                            | Lark app id; must be set together with the secret    |
 | `LARK_APP_SECRET` | –                        | Lark app secret; unset disables the bot              |
 | `LARK_DOMAIN` | `feishu`                     | `feishu` (mainland China) or `lark` (international)  |

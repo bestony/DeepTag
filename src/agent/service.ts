@@ -8,15 +8,29 @@
 
 import { config } from "../config.ts";
 import { logger } from "../logger.ts";
+import { loadInstructions } from "./instructions.ts";
 import { PROVIDER_ID, resolveModel } from "./model.ts";
 import { createAgentRunner, type AgentReply, type AgentRunner } from "./runner.ts";
 
 export type AgentStatus =
   | { readonly enabled: false }
-  | { readonly enabled: true; readonly model: string; readonly sessions: number };
+  | {
+      readonly enabled: true;
+      readonly model: string;
+      readonly sessions: number;
+      /**
+       * Which DATA_DIR files ended up in the system prompt. Empty is a valid
+       * state, and reporting it answers "is my AGENTS.md actually loaded?"
+       * without reading the process's logs.
+       */
+      readonly instructionFiles: readonly string[];
+    };
 
 /** `undefined` = not resolved yet, `null` = resolution attempted and failed. */
 let runner: AgentRunner | null | undefined;
+
+/** Files from DATA_DIR that contributed to the prompt, captured at init. */
+let instructionFiles: readonly string[] = [];
 
 /**
  * Resolves the model once. Call at startup so a bad AGENT_MODEL is reported
@@ -47,12 +61,22 @@ export const initAgent = (): void => {
     return;
   }
 
-  runner = createAgentRunner(agentConfig, resolution.binding);
+  // Read once, here: every session created later shares this prompt, so edits
+  // to AGENTS.md or MEMORY.md land on the next restart rather than mid-chat.
+  const instructions = loadInstructions(config.dataDir, agentConfig.systemPrompt);
+  instructionFiles = instructions.loaded;
+
+  runner = createAgentRunner(
+    { ...agentConfig, systemPrompt: instructions.systemPrompt },
+    resolution.binding,
+  );
   logger.info("agent ready", {
     provider: PROVIDER_ID,
     model: resolution.binding.model.id,
     contextWindow: resolution.binding.model.contextWindow,
     timeoutMs: agentConfig.timeoutMs,
+    dataDir: config.dataDir,
+    instructionFiles,
   });
 };
 
@@ -60,7 +84,12 @@ export const getAgentStatus = (): AgentStatus => {
   if (runner === undefined || runner === null || config.agent === null) {
     return { enabled: false };
   }
-  return { enabled: true, model: config.agent.model, sessions: runner.sessionCount() };
+  return {
+    enabled: true,
+    model: config.agent.model,
+    sessions: runner.sessionCount(),
+    instructionFiles,
+  };
 };
 
 /**

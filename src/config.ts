@@ -10,6 +10,8 @@
  * reintroduce exactly that ordering hazard.
  */
 
+import { resolve } from "node:path";
+
 import { config as loadDotenv } from "dotenv";
 
 export const LOG_LEVELS = ["debug", "info", "warn", "error", "silent"] as const;
@@ -40,6 +42,13 @@ export type AppConfig = {
   readonly logLevel: LogLevel;
   readonly nodeEnv: string;
   readonly isProduction: boolean;
+  /**
+   * Absolute path to the directory holding operator-editable state — today
+   * AGENTS.md and MEMORY.md, which shape the agent's system prompt. Absolute so
+   * every log line names the same location regardless of the working directory
+   * a deployment happens to start in. The directory need not exist.
+   */
+  readonly dataDir: string;
   /** `null` when credentials are absent — the bot is then simply disabled. */
   readonly lark: LarkConfig | null;
   /** `null` without a DeepSeek API key — messages then get a "not configured" reply. */
@@ -50,6 +59,10 @@ const DEFAULT_PORT = 3000;
 // Loopback by default so a dev server is not exposed to the local network;
 // container deployments set HOST=0.0.0.0 explicitly.
 const DEFAULT_HOST = "127.0.0.1";
+
+// Relative to the working directory, which for every documented way of starting
+// the server is the project root.
+const DEFAULT_DATA_DIR = "data";
 
 export const DEFAULT_AGENT_MODEL = "deepseek-v4-flash";
 
@@ -197,6 +210,9 @@ export const config: AppConfig = {
   logLevel: resolveLogLevel(nodeEnv),
   nodeEnv,
   isProduction: nodeEnv === "production",
+  // `resolve` leaves an absolute DATA_DIR untouched and anchors a relative one
+  // to the working directory.
+  dataDir: resolve(read("DATA_DIR") ?? DEFAULT_DATA_DIR),
   lark: resolveLark(),
   agent: resolveAgent(),
 };
