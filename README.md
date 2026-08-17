@@ -63,6 +63,12 @@ The event handler acknowledges immediately and answers out of band, because the
 gateway redelivers events whose handler does not return promptly and a model
 turn can take tens of seconds.
 
+Redelivered events are dropped by `event_id` (falling back to `message_id`)
+through the bounded, expiring set in `src/dedupe.ts` — otherwise a redelivery
+would cost the user a duplicate reply and cost the account a duplicate model
+call. Keys are claimed synchronously, before any `await`, so two deliveries
+racing each other cannot both pass. The window is one hour and 10,000 keys.
+
 Note that `pnpm dev` reconnects on every file change, since `node --watch`
 restarts the process.
 

@@ -2,7 +2,16 @@ import * as Lark from "@larksuiteoapi/node-sdk";
 
 import type { AgentReply } from "../agent/runner.ts";
 import { runAgent } from "../agent/service.ts";
+import { createSeenSet, type SeenSet } from "../dedupe.ts";
 import { logger } from "../logger.ts";
+
+/**
+ * Idempotency window for redelivered events. Retaining a key too long only
+ * costs a little memory; retaining it too briefly costs the user a duplicate
+ * reply and a duplicate model call, so this errs long.
+ */
+const DEDUPE_TTL_MS = 60 * 60 * 1000;
+const DEDUPE_MAX_ENTRIES = 10_000;
 
 /**
  * `message.content` arrives as a JSON string whose shape depends on
@@ -130,6 +139,7 @@ export const createEventDispatcher = (
   client: Lark.Client,
   logging: DispatcherLogging,
   runPrompt: PromptRunner = runAgent,
+  seen: SeenSet = createSeenSet({ maxEntries: DEDUPE_MAX_ENTRIES, ttlMs: DEDUPE_TTL_MS }),
 ): Lark.EventDispatcher =>
   new Lark.EventDispatcher(logging).register({
     "im.message.receive_v1": async (data) => {
@@ -142,6 +152,20 @@ export const createEventDispatcher = (
       } = message;
 
       logger.info("lark message received", { eventId, chatId, messageId, messageType });
+
+      // The gateway redelivers events it considers unacknowledged, and this
+      // handler acks before the answer exists — so a redelivery would otherwise
+      // mean a second reply and a second model call. `event_id` is Lark's
+      // idempotency key; `message_id` covers the events that omit it, since one
+      // message produces one receive event. The key is namespaced by event type
+      // so the fallback cannot collide across event kinds.
+      //
+      // Claimed before any await: two deliveries racing here must not both pass.
+      const idempotencyKey = `im.message.receive_v1:${eventId ?? messageId}`;
+      if (!seen.claim(idempotencyKey)) {
+        logger.info("duplicate lark event ignored", { eventId, chatId, messageId });
+        return;
+      }
 
       if (messageType !== "text") {
         logger.debug("ignoring non-text message", { messageId, messageType });
