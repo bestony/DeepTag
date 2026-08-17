@@ -38,11 +38,17 @@ import { logger } from "../logger.ts";
 const MAX_SLUG_LENGTH = 48;
 
 export type ChatWorkspace = {
-  /** Absolute working directory, or `null` when no workspace is available. */
-  readonly dir: string | null;
-  /** File and shell tools bound to `dir`; empty when `dir` is `null`. */
+  /**
+   * Absolute directory for this chat. Always the intended path, even when it
+   * could not be created — callers that only need a stable per-chat identity
+   * (the transcript store keys on it) should not have to care.
+   */
+  readonly dir: string;
+  /** False when the directory could not be prepared; tools and prompt are then empty. */
+  readonly ready: boolean;
+  /** File and shell tools bound to `dir`; empty unless `ready`. */
   readonly tools: readonly AgentTool<any>[];
-  /** System prompt block naming the directory; empty when `dir` is `null`. */
+  /** System prompt block naming the directory; empty unless `ready`. */
   readonly prompt: string;
   /** Kills anything the shell tool still has running. Never rejects. */
   cleanup(): Promise<void>;
@@ -62,8 +68,9 @@ export type WorkspaceProvider = {
  * this way rather than refusing to start keeps a broken disk from taking the
  * whole bot down, and never leaves the model holding tools that cannot work.
  */
-const unavailable = (): ChatWorkspace => ({
-  dir: null,
+const unavailable = (dir: string): ChatWorkspace => ({
+  dir,
+  ready: false,
   tools: [],
   prompt: "",
   cleanup: async () => {},
@@ -155,16 +162,16 @@ export const createWorkspaceProvider = (
   }
 
   const open = (chatId: string): ChatWorkspace => {
-    if (!ready) {
-      return unavailable();
-    }
-
     const dir = resolve(root, workspaceName(chatId));
+
+    if (!ready) {
+      return unavailable(dir);
+    }
     // Guaranteed by the slug rule above, so this only fires if that rule is
     // ever loosened — which is exactly when it needs to be caught.
     if (!dir.startsWith(root + sep)) {
       logger.error("workspace path escaped the root, refusing to use it", { chatId, dir, root });
-      return unavailable();
+      return unavailable(dir);
     }
 
     try {
@@ -176,13 +183,14 @@ export const createWorkspaceProvider = (
         code: (err as NodeJS.ErrnoException).code,
         error: err instanceof Error ? err.message : String(err),
       });
-      return unavailable();
+      return unavailable(dir);
     }
 
     const env = new NodeExecutionEnv({ cwd: dir });
 
     return {
       dir,
+      ready: true,
       tools: createTools(env, shellEnv),
       prompt: describeWorkspace(dir),
       cleanup: async () => {

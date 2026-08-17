@@ -145,3 +145,7 @@ vite.config.ts.timestamp-*
 # Agent workspaces (WORKSPACE_DIR): files the agent creates while working,
 # one directory per chat. Runtime output, never source.
 /workspace/
+
+# Conversation transcripts (SESSION_DIR). Runtime state, and it holds whatever
+# users said to the bot.
+/sessions/

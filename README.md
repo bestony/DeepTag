@@ -87,6 +87,7 @@ Set `DEEPSEEK_API_KEY` to enable it; `AGENT_MODEL` defaults to
 | `src/agent/model.ts`        | Registers the DeepSeek provider and resolves the model  |
 | `src/agent/instructions.ts` | Builds the system prompt from `DATA_DIR`                |
 | `src/agent/workspace.ts`    | Per-chat workspaces and the tools bound to them         |
+| `src/agent/transcript.ts`   | Persisted transcripts, so a chat resumes after restart  |
 | `src/agent/runner.ts`       | Per-chat sessions, serialization, timeouts, pruning     |
 | `src/agent/service.ts`      | The app-wide instance wired from configuration          |
 
@@ -95,13 +96,17 @@ smaller catalog means a smaller failure surface and no unrelated provider SDKs
 loaded at runtime.
 
 **Conversation state.** Each Lark `chat_id` gets its own `Agent`, which owns
-that chat's transcript, so follow-up messages keep context. Three bounds keep
-that from growing without limit:
+that chat's transcript, so follow-up messages keep context. The in-memory
+registry is a cache over the persisted transcript (below), and is bounded:
 
-- at most 200 chats are tracked, evicting the least recently used;
-- a chat idle for an hour starts fresh;
+- at most 200 chats are held in memory, evicting the least recently used;
+- a chat idle for an hour is dropped from memory;
 - at most 60 transcript messages are resent per turn, since every turn resends
   the history and that is what drives cost.
+
+The first two bound memory, not the conversation: a dropped chat is restored
+from disk on its next message. The third bounds what is *sent*, not what is
+*stored*.
 
 **Serialization.** Runs for one chat are chained, because a single stateful
 `Agent` driven by two concurrent messages would interleave their transcripts.
@@ -109,6 +114,46 @@ Different chats still run concurrently.
 
 **Tools.** Each session gets `read`, `write`, `edit` and `bash`, bound to that
 chat's workspace — see below.
+
+### Session persistence
+
+A chat's conversation is kept on disk under `SESSION_DIR` (default
+`./sessions`), one transcript per chat, so the same chat reuses the same session
+rather than starting over. A session is read back when it is (re)created and
+appended to after every run, which means a chat survives eviction, the idle TTL
+and a redeploy alike — none of which a user in a chat window has any reason to
+experience as amnesia.
+
+The format is pi-agent-core's own JSONL session log: a header line, then one
+entry per message on the `main` lane. Using the library's store rather than a
+bespoke file keeps the format one its tooling already understands, and leaves
+the door open to adopting `AgentHarness` later without migrating anything. Only
+a slice of it is written — messages — while branching, compaction records and
+usage accounting are things the harness writes and DeepTag does not.
+
+Transcripts are keyed by the chat's workspace directory, which is the `cwd` the
+format indexes on:
+
+```
+sessions/                              # SESSION_DIR
+└── --path-to-workspace-oc_9a3f1c...--/
+    └── 2026-08-17T03-18-15-929Z_01a00dba-....jsonl
+```
+
+On restore only the last 60 messages are loaded, since that is all a turn would
+send anyway; the rest stays on disk as the record. A restored transcript that
+would begin with a `toolResult` is trimmed further — without the assistant
+message that requested it, the provider rejects it as an orphan.
+
+Everything a run produces is persisted, including on failure, so the file
+mirrors the transcript in memory. A turn that errored therefore leaves an empty
+assistant message in the history; it is resent until it scrolls out of the
+60-message window.
+
+Nothing here is fatal: a transcript that cannot be read or written costs the
+conversation its memory, logged as an error, and the user still gets their
+reply. Nothing is ever deleted either, so growth on disk is yours to manage —
+and note that these files hold whatever users said to the bot.
 
 ### Workspace
 
@@ -214,6 +259,7 @@ every variable is optional.
 | `NODE_ENV`  | `development`                  | `production` narrows the default log level to `info` |
 | `DATA_DIR`  | `./data`                       | Holds `AGENTS.md` and `MEMORY.md`; need not exist    |
 | `WORKSPACE_DIR` | `./workspace`              | Root of the per-chat workspaces; created at startup  |
+| `SESSION_DIR` | `./sessions`                 | Persisted transcripts, one per chat; created on demand |
 | `LARK_APP_ID` | –                            | Lark app id; must be set together with the secret    |
 | `LARK_APP_SECRET` | –                        | Lark app secret; unset disables the bot              |
 | `LARK_DOMAIN` | `feishu`                     | `feishu` (mainland China) or `lark` (international)  |

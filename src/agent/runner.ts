@@ -10,14 +10,20 @@
  * - runs for one chat must be serialized, because driving a single stateful
  *   Agent from two concurrent messages interleaves their transcripts.
  *
+ * That registry is a cache, not the record. Every session is seeded from, and
+ * appended to, the transcript on disk (`transcript.ts`), so a chat dropped by
+ * the bounds above — or by a redeploy — picks its conversation back up on the
+ * next message. What is bounded is memory, not the conversation.
+ *
  * A session also owns a workspace — the directory it works in, and the file and
  * shell tools bound to it. Both are opened when the session is created, which
  * is what "the agent starts in its workspace" means in practice: no session
  * exists without one, and no tool can be called before the directory is there.
  *
- * The runner takes its model binding and workspace provider as arguments rather
- * than reading config, so it can be exercised against a faux provider and a
- * temporary directory. `service.ts` wires the application-wide instance.
+ * The runner takes its model binding, workspace provider and transcript store
+ * as arguments rather than reading config, so it can be exercised against a
+ * faux provider and a temporary directory. `service.ts` wires the
+ * application-wide instance.
  */
 
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
@@ -25,15 +31,18 @@ import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AgentConfig } from "../config.ts";
 import { logger } from "../logger.ts";
 import { PROVIDER_ID, type ModelBinding } from "./model.ts";
+import type { ChatTranscript, TranscriptStore } from "./transcript.ts";
 import type { ChatWorkspace, WorkspaceProvider } from "./workspace.ts";
 
-/** Chats tracked at once; the least recently used is dropped beyond this. */
+/** Chats held in memory at once; the least recently used is dropped beyond this. */
 const MAX_SESSIONS = 200;
-/** A chat with no traffic for this long starts fresh next time. */
+/** A chat with no traffic for this long is dropped from memory, not forgotten. */
 const SESSION_TTL_MS = 60 * 60 * 1000;
 /**
- * Transcript messages kept per chat. DeepSeek V4's context window is large, but
- * every turn resends the history, so this caps cost growth on a long chat.
+ * Transcript messages kept in the model's context. DeepSeek V4's context window
+ * is large, but every turn resends the history, so this caps cost growth on a
+ * long chat. It bounds what is *sent*, not what is *stored*: the transcript on
+ * disk keeps everything, and this is also how much of it is restored.
  */
 const MAX_HISTORY_MESSAGES = 60;
 
@@ -57,13 +66,33 @@ export type AgentRunner = {
   clear(): void;
 };
 
+/** A chat's live session: created once, reused by every run for that chat. */
 type Session = {
   readonly agent: Agent;
   readonly workspace: ChatWorkspace;
+  readonly transcript: ChatTranscript;
+};
+
+/**
+ * A chat's registry entry.
+ *
+ * Separate from `Session` because opening one is asynchronous — it reads the
+ * transcript off disk — while the bookkeeping that keeps concurrent runs in
+ * order must happen synchronously, before any `await` gives a second message
+ * the chance to interleave. Holding the *promise* of a session is what lets
+ * both be true: two messages arriving at once queue against the same tail and
+ * then await the same open.
+ */
+type Slot = {
+  /** Resolves to the session; rejects only if opening it failed outright. */
+  readonly session: Promise<Session>;
   lastUsedAt: number;
   /** Tail of this chat's run chain; see the serialization note above. */
   tail: Promise<unknown>;
 };
+
+const describeError = (err: unknown): string =>
+  err instanceof Error ? err.message : String(err);
 
 /**
  * Drops the oldest history while making sure the surviving transcript never
@@ -96,59 +125,57 @@ export const createAgentRunner = (
   agentConfig: AgentConfig,
   binding: ModelBinding,
   workspaces: WorkspaceProvider,
+  transcripts: TranscriptStore,
 ): AgentRunner => {
-  const sessions = new Map<string, Session>();
+  const slots = new Map<string, Slot>();
 
   /**
-   * Drops a session and releases its workspace. The directory itself stays on
-   * disk — only the transcript and any processes the shell tool left running
-   * are discarded.
+   * Drops a chat from memory and releases what it holds. Neither the workspace
+   * directory nor the transcript is deleted: this frees memory and stops stray
+   * child processes, it does not end the conversation.
    */
-  const dropSession = (chatId: string, session: Session): void => {
-    sessions.delete(chatId);
-    session.agent.abort();
-    void session.workspace.cleanup();
+  const dropSlot = (chatId: string, slot: Slot): void => {
+    slots.delete(chatId);
+    // The session may still be opening; wait for it rather than leaking
+    // whatever it is about to create.
+    void slot.session.then(
+      (session) => {
+        session.agent.abort();
+        return session.workspace.cleanup();
+      },
+      () => undefined,
+    );
   };
 
-  const evictStaleSessions = (now: number): void => {
-    for (const [chatId, session] of sessions) {
-      if (now - session.lastUsedAt > SESSION_TTL_MS) {
-        dropSession(chatId, session);
-        logger.debug("agent session expired", { chatId });
+  const evictStaleSlots = (now: number): void => {
+    for (const [chatId, slot] of slots) {
+      if (now - slot.lastUsedAt > SESSION_TTL_MS) {
+        dropSlot(chatId, slot);
+        logger.debug("agent session expired, transcript kept", { chatId });
       }
     }
     // Map iterates in insertion order and every use re-inserts, so the first
     // key is the least recently used.
-    while (sessions.size > MAX_SESSIONS) {
-      const oldest = sessions.entries().next();
+    while (slots.size > MAX_SESSIONS) {
+      const oldest = slots.entries().next();
       if (oldest.done === true) {
         break;
       }
-      const [chatId, session] = oldest.value;
-      dropSession(chatId, session);
-      logger.debug("agent session evicted, session limit reached", {
+      const [chatId, slot] = oldest.value;
+      dropSlot(chatId, slot);
+      logger.debug("agent session evicted, session limit reached, transcript kept", {
         chatId,
         limit: MAX_SESSIONS,
       });
     }
   };
 
-  const getSession = (chatId: string): Session => {
-    const now = Date.now();
-    evictStaleSessions(now);
-
-    const existing = sessions.get(chatId);
-    if (existing !== undefined) {
-      existing.lastUsedAt = now;
-      // Re-insert to mark as most recently used.
-      sessions.delete(chatId);
-      sessions.set(chatId, existing);
-      return existing;
-    }
-
+  const openSession = async (chatId: string): Promise<Session> => {
     // Opened before the Agent exists, so the directory is on disk before the
     // model can be told about it, let alone call a tool against it.
     const workspace = workspaces.open(chatId);
+    // Keyed on the workspace directory, which is this chat's stable identity.
+    const transcript = await transcripts.open(chatId, workspace.dir, MAX_HISTORY_MESSAGES);
 
     const agent = new Agent({
       initialState: {
@@ -161,6 +188,8 @@ export const createAgentRunner = (
             : `${agentConfig.systemPrompt}\n\n${workspace.prompt}`,
         model: binding.model,
         tools: [...workspace.tools],
+        // What makes this a resumed conversation rather than a new one.
+        messages: [...transcript.messages],
       },
       streamFn: binding.models.streamSimple.bind(binding.models),
       transformContext: async (messages) => pruneHistory(messages),
@@ -171,14 +200,40 @@ export const createAgentRunner = (
       sessionId: chatId,
     });
 
-    const created: Session = { agent, workspace, lastUsedAt: now, tail: Promise.resolve() };
-    sessions.set(chatId, created);
-    logger.debug("agent session created", {
+    logger.debug("agent session opened", {
       chatId,
-      sessions: sessions.size,
+      sessions: slots.size,
+      resumed: transcript.resumed,
+      restoredMessages: transcript.messages.length,
       workspaceDir: workspace.dir,
+      workspaceReady: workspace.ready,
       tools: workspace.tools.map((tool) => tool.name),
     });
+    return { agent, workspace, transcript };
+  };
+
+  const getSlot = (chatId: string): Slot => {
+    const now = Date.now();
+    evictStaleSlots(now);
+
+    const existing = slots.get(chatId);
+    if (existing !== undefined) {
+      existing.lastUsedAt = now;
+      // Re-insert to mark as most recently used.
+      slots.delete(chatId);
+      slots.set(chatId, existing);
+      return existing;
+    }
+
+    // Registered synchronously, so a second message arriving while this one is
+    // still reading the transcript joins the same session instead of opening a
+    // second one over the same files.
+    const created: Slot = {
+      session: openSession(chatId),
+      lastUsedAt: now,
+      tail: Promise.resolve(),
+    };
+    slots.set(chatId, created);
     return created;
   };
 
@@ -188,30 +243,40 @@ export const createAgentRunner = (
     prompt: string,
   ): Promise<AgentReply> => {
     const startedAt = performance.now();
-    // Everything appended from here on belongs to this run, which is how the
-    // tool calls below are counted.
+    // Everything appended from here on belongs to this run: it is both what
+    // gets persisted below and how the tool calls are counted.
     const messagesBefore = session.agent.state.messages.length;
     // abort() rather than racing a rejection: it also stops the provider stream.
     const timer = setTimeout(() => session.agent.abort(), agentConfig.timeoutMs);
 
+    let failure: { readonly error: unknown } | undefined;
     try {
       await session.agent.prompt(prompt);
     } catch (err) {
-      logger.error("agent run threw", {
-        chatId,
-        error: err instanceof Error ? err.message : String(err),
-        stack: err instanceof Error ? err.stack : undefined,
-      });
-      return {
-        ok: false,
-        reason: "failed",
-        detail: err instanceof Error ? err.message : String(err),
-      };
+      failure = { error: err };
     } finally {
       clearTimeout(timer);
     }
 
     const durationMs = Math.round(performance.now() - startedAt);
+    const produced = session.agent.state.messages.slice(messagesBefore);
+
+    // Persisted before answering, and on the failure path too: the file should
+    // mirror the transcript in memory, and a turn that failed halfway is still
+    // part of the conversation. Awaited rather than fired and forgotten, so a
+    // crash just after the reply cannot lose the exchange it was replying to.
+    await session.transcript.append(produced);
+
+    if (failure !== undefined) {
+      logger.error("agent run threw", {
+        chatId,
+        durationMs,
+        error: describeError(failure.error),
+        stack: failure.error instanceof Error ? failure.error.stack : undefined,
+      });
+      return { ok: false, reason: "failed", detail: describeError(failure.error) };
+    }
+
     const last = session.agent.state.messages.at(-1);
 
     if (last === undefined || last.role !== "assistant") {
@@ -227,9 +292,8 @@ export const createAgentRunner = (
       workspaceDir: session.workspace.dir,
       // A turn that used tools takes several model round-trips, so this is the
       // first thing to look at when a run is slow or hits the timeout.
-      toolCalls: session.agent.state.messages
-        .slice(messagesBefore)
-        .filter((message) => message.role === "toolResult").length,
+      toolCalls: produced.filter((message) => message.role === "toolResult").length,
+      persistedMessages: produced.length,
       inputTokens: last.usage.input,
       outputTokens: last.usage.output,
       reasoningTokens: last.usage.reasoning,
@@ -258,17 +322,30 @@ export const createAgentRunner = (
 
   return {
     run: async (chatId, prompt) => {
-      const session = getSession(chatId);
+      const slot = getSlot(chatId);
       // Queue behind this chat's previous run. `execute` resolves rather than
       // rejects, so the chain cannot be poisoned by one bad run.
-      const started = session.tail.then(() => execute(session, chatId, prompt));
-      session.tail = started.catch(() => undefined);
-      return started;
+      const started = slot.tail.then(async () => execute(await slot.session, chatId, prompt));
+      slot.tail = started.catch(() => undefined);
+
+      try {
+        return await started;
+      } catch (err) {
+        // Only opening the session can land here. Drop the slot so the next
+        // message retries instead of inheriting a permanently broken one.
+        slots.delete(chatId);
+        logger.error("agent session could not be opened", {
+          chatId,
+          error: describeError(err),
+          stack: err instanceof Error ? err.stack : undefined,
+        });
+        return { ok: false, reason: "failed", detail: describeError(err) };
+      }
     },
-    sessionCount: () => sessions.size,
+    sessionCount: () => slots.size,
     clear: () => {
-      for (const [chatId, session] of sessions) {
-        dropSession(chatId, session);
+      for (const [chatId, slot] of slots) {
+        dropSlot(chatId, slot);
       }
     },
   };

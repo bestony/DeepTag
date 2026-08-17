@@ -11,6 +11,7 @@ import { logger } from "../logger.ts";
 import { loadInstructions } from "./instructions.ts";
 import { PROVIDER_ID, resolveModel } from "./model.ts";
 import { createAgentRunner, type AgentReply, type AgentRunner } from "./runner.ts";
+import { createTranscriptStore } from "./transcript.ts";
 import { createWorkspaceProvider } from "./workspace.ts";
 
 export type AgentStatus =
@@ -82,10 +83,15 @@ export const initAgent = (): void => {
   const workspaces = createWorkspaceProvider(config.workspace.root, config.workspace.shellEnv);
   workspaceReady = workspaces.ready;
 
+  // Directories under here are created on demand, as each chat's transcript is
+  // first written, so there is nothing to prepare or verify at startup.
+  const transcripts = createTranscriptStore(config.sessionDir);
+
   runner = createAgentRunner(
     { ...agentConfig, systemPrompt: instructions.systemPrompt },
     resolution.binding,
     workspaces,
+    transcripts,
   );
   logger.info("agent ready", {
     provider: PROVIDER_ID,
@@ -96,6 +102,7 @@ export const initAgent = (): void => {
     instructionFiles,
     workspaceRoot: config.workspace.root,
     workspaceReady,
+    sessionDir: config.sessionDir,
   });
 };
 

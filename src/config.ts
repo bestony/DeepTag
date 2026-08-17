@@ -64,6 +64,12 @@ export type AppConfig = {
   readonly dataDir: string;
   /** Where agent sessions do their work; see WORKSPACE_DIR. */
   readonly workspace: WorkspaceConfig;
+  /**
+   * Absolute root of the persisted session transcripts, one JSONL file per
+   * chat. Kept away from the workspace on purpose: the agent must not be able
+   * to rewrite the record of what it was asked to do.
+   */
+  readonly sessionDir: string;
   /** `null` when credentials are absent — the bot is then simply disabled. */
   readonly lark: LarkConfig | null;
   /** `null` without a DeepSeek API key — messages then get a "not configured" reply. */
@@ -83,6 +89,8 @@ const DEFAULT_DATA_DIR = "data";
 // the agent can write and run shell commands in its workspace, so nesting the
 // two would let it rewrite its own AGENTS.md. Overlap is warned about below.
 const DEFAULT_WORKSPACE_DIR = "workspace";
+
+const DEFAULT_SESSION_DIR = "sessions";
 
 /**
  * Variable names copied into the agent's shell environment.
@@ -279,15 +287,26 @@ const nodeEnv = read("NODE_ENV") ?? "development";
 // working directory.
 const dataDir = resolve(read("DATA_DIR") ?? DEFAULT_DATA_DIR);
 const workspaceRoot = resolve(read("WORKSPACE_DIR") ?? DEFAULT_WORKSPACE_DIR);
+const sessionDir = resolve(read("SESSION_DIR") ?? DEFAULT_SESSION_DIR);
 
-// Not fatal — an operator may well mean it — but worth saying out loud, because
-// the agent has write and shell access to its workspace and would then be able
-// to edit the very instructions it is given.
-if (overlaps(dataDir, workspaceRoot)) {
-  configWarnings.push(
-    `WORKSPACE_DIR (${workspaceRoot}) overlaps DATA_DIR (${dataDir}); the agent can then rewrite its own AGENTS.md and MEMORY.md`,
-  );
-}
+/**
+ * The three directories must stay disjoint, and for the same reason each time:
+ * the agent can write and run shell commands inside its workspace, so anything
+ * nested there is something it can rewrite — the instructions it was given, or
+ * the record of what it did. Warned about rather than rejected, because an
+ * operator may genuinely mean it.
+ */
+const warnIfOverlapping = (nameA: string, pathA: string, nameB: string, pathB: string): void => {
+  if (overlaps(pathA, pathB)) {
+    configWarnings.push(
+      `${nameA} (${pathA}) overlaps ${nameB} (${pathB}); keep them separate, or the agent can rewrite files it should only ever read`,
+    );
+  }
+};
+
+warnIfOverlapping("WORKSPACE_DIR", workspaceRoot, "DATA_DIR", dataDir);
+warnIfOverlapping("SESSION_DIR", sessionDir, "WORKSPACE_DIR", workspaceRoot);
+warnIfOverlapping("SESSION_DIR", sessionDir, "DATA_DIR", dataDir);
 
 export const config: AppConfig = {
   port: readInt("PORT", { min: 0, max: 65535, fallback: DEFAULT_PORT }),
@@ -297,6 +316,7 @@ export const config: AppConfig = {
   isProduction: nodeEnv === "production",
   dataDir,
   workspace: { root: workspaceRoot, shellEnv: resolveShellEnv() },
+  sessionDir,
   lark: resolveLark(),
   agent: resolveAgent(),
 };
