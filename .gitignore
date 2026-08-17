@@ -149,3 +149,6 @@ vite.config.ts.timestamp-*
 # Conversation transcripts (SESSION_DIR). Runtime state, and it holds whatever
 # users said to the bot.
 /sessions/
+
+# What the agent remembers about people and chats (MEMORY_DIR). Same reasoning.
+/memory/

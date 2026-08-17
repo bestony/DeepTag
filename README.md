@@ -87,6 +87,9 @@ Set `DEEPSEEK_API_KEY` to enable it; `AGENT_MODEL` defaults to
 | `src/agent/model.ts`        | Registers the DeepSeek provider and resolves the model  |
 | `src/agent/instructions.ts` | Builds the system prompt from `DATA_DIR`                |
 | `src/agent/workspace.ts`    | Per-chat workspaces and the tools bound to them         |
+| `src/agent/memory.ts`       | Memory about people and chats, and who may recall it    |
+| `src/agent/memory-tools.ts` | The `remember` and `recall` tools                       |
+| `src/agent/distill.ts`      | Post-turn extraction of what is worth remembering       |
 | `src/agent/transcript.ts`   | Persisted transcripts, so a chat resumes after restart  |
 | `src/agent/runner.ts`       | Per-chat sessions, serialization, timeouts, pruning     |
 | `src/agent/service.ts`      | The app-wide instance wired from configuration          |
@@ -113,7 +116,63 @@ from disk on its next message. The third bounds what is *sent*, not what is
 Different chats still run concurrently.
 
 **Tools.** Each session gets `read`, `write`, `edit` and `bash`, bound to that
-chat's workspace — see below.
+chat's workspace, plus `remember` and `recall` — see below.
+
+### Memory about people and chats
+
+`DATA_DIR/MEMORY.md` is one file you write by hand, shared by every
+conversation. This is the other half: memory the agent accumulates itself,
+filed under *who* or *where* it is about, so that "what did this person decide"
+and "what does this team have going on" are separate questions with separate
+answers. It lives under `MEMORY_DIR` (default `./memory`), one JSONL file per
+subject:
+
+```
+memory/                          # MEMORY_DIR
+├── users/ou_9a3f1c...-4e91b0d2.jsonl    # keyed by Lark open_id
+└── groups/oc_71bd88...-c07af5e3.jsonl   # keyed by chat_id
+```
+
+A `user` subject follows a person between chats; a `group` subject is always
+the chat being replied in — the model cannot name another chat, which removes
+cross-group leakage as a possibility rather than as a rule to enforce.
+
+**Writing** happens two ways, because their failure modes are opposite. The
+`remember` tool covers what the agent notices it should keep; a post-turn
+distiller — a second, cheap model call on the finished exchange — covers what
+it did not. The tool forgets to fire, the distiller over-collects, so its prompt
+is written to prefer recording nothing and the store drops duplicates
+(whitespace- and case-insensitive). Distillation runs detached, after the reply
+is on its way, and only for turns that actually produced an answer.
+
+**Reading** also happens two ways. The current speaker's memory and this chat's
+memory are rendered into the system prompt on every turn, capped at 12 entries
+each, so the common case needs no tool call. `recall` is there for older entries
+and for topic searches. Memory goes in the *system* prompt, not the user
+message: it is instruction rather than conversation, and the system prompt is
+never written to the transcript, so today's snapshot does not sit in the history
+forever being resent long after it went stale.
+
+In a group the speaker changes from message to message while the session does
+not, so identity belongs to the request (`src/agent/request.ts`). The prompt is
+recomposed and the tools are rebound before each run.
+
+**Visibility.** Every entry records the chat it was learned in, and that decides
+who may see it again:
+
+| Learned in    | Recallable from                                    |
+| ------------- | -------------------------------------------------- |
+| a group chat  | anywhere — it was said in front of others          |
+| a private chat| only a private chat with that same person          |
+
+Without the second rule a bot that remembers usefully also gossips: someone
+confides a plan in a DM and the agent repeats it in a team channel a week later.
+Cross-chat memory about a person still works — it is the *private* half that
+stays private. The rule is enforced on read, not on write, so the record stays
+complete and auditable.
+
+Nothing is ever deleted, and the files hold what people said about each other,
+so treat `MEMORY_DIR` as sensitive and manage its growth yourself.
 
 ### Session persistence
 
@@ -260,6 +319,7 @@ every variable is optional.
 | `DATA_DIR`  | `./data`                       | Holds `AGENTS.md` and `MEMORY.md`; need not exist    |
 | `WORKSPACE_DIR` | `./workspace`              | Root of the per-chat workspaces; created at startup  |
 | `SESSION_DIR` | `./sessions`                 | Persisted transcripts, one per chat; created on demand |
+| `MEMORY_DIR` | `./memory`                    | Memory about people and chats; created on demand      |
 | `LARK_APP_ID` | –                            | Lark app id; must be set together with the secret    |
 | `LARK_APP_SECRET` | –                        | Lark app secret; unset disables the bot              |
 | `LARK_DOMAIN` | `feishu`                     | `feishu` (mainland China) or `lark` (international)  |

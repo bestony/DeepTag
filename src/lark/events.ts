@@ -1,5 +1,6 @@
 import * as Lark from "@larksuiteoapi/node-sdk";
 
+import type { ChatRequest, ChatType } from "../agent/request.ts";
 import type { AgentReply } from "../agent/runner.ts";
 import { runAgent } from "../agent/service.ts";
 import { createSeenSet, type SeenSet } from "../dedupe.ts";
@@ -57,7 +58,7 @@ const renderReply = (reply: AgentReply): { title: string; content: string } => {
 };
 
 /** Injected so tests can drive the handler without a live model. */
-export type PromptRunner = (chatId: string, prompt: string) => Promise<AgentReply>;
+export type PromptRunner = (request: ChatRequest, prompt: string) => Promise<AgentReply>;
 
 /** Logger wiring shared with the rest of the SDK, so its output stays JSON. */
 export type DispatcherLogging = {
@@ -72,13 +73,14 @@ export type DispatcherLogging = {
 const answer = async (
   client: Lark.Client,
   runPrompt: PromptRunner,
-  chatId: string,
+  request: ChatRequest,
   messageId: string,
   prompt: string,
 ): Promise<void> => {
+  const chatId = request.chatId;
   let reply: AgentReply;
   try {
-    reply = await runPrompt(chatId, prompt);
+    reply = await runPrompt(request, prompt);
   } catch (err) {
     // runAgent is documented not to reject; treat a breach as a failed turn
     // rather than letting it escape as an unhandled rejection.
@@ -143,15 +145,33 @@ export const createEventDispatcher = (
 ): Lark.EventDispatcher =>
   new Lark.EventDispatcher(logging).register({
     "im.message.receive_v1": async (data) => {
-      const { message, event_id: eventId } = data;
+      const { message, sender, event_id: eventId } = data;
       const {
         chat_id: chatId,
+        chat_type: chatType,
         message_id: messageId,
         message_type: messageType,
         content,
       } = message;
 
-      logger.info("lark message received", { eventId, chatId, messageId, messageType });
+      // Only `p2p` is a private conversation; every other chat kind is treated
+      // as a group, which is the conservative reading for memory visibility —
+      // an unfamiliar value must not make a chat look private.
+      const request: ChatRequest = {
+        chatId,
+        chatType: (chatType === "p2p" ? "p2p" : "group") satisfies ChatType,
+        // Absent for messages the platform does not attribute to a person.
+        senderOpenId: sender?.sender_id?.open_id ?? null,
+      };
+
+      logger.info("lark message received", {
+        eventId,
+        chatId,
+        chatType,
+        senderOpenId: request.senderOpenId,
+        messageId,
+        messageType,
+      });
 
       // The gateway redelivers events it considers unacknowledged, and this
       // handler acks before the answer exists — so a redelivery would otherwise
@@ -182,6 +202,6 @@ export const createEventDispatcher = (
       // does not return promptly, and a model turn can take tens of seconds.
       // The reply is a separate API call, so acking first loses nothing; runs
       // for one chat are still serialized inside the agent runner.
-      void answer(client, runPrompt, chatId, messageId, text);
+      void answer(client, runPrompt, request, messageId, text);
     },
   });

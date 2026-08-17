@@ -70,6 +70,12 @@ export type AppConfig = {
    * to rewrite the record of what it was asked to do.
    */
   readonly sessionDir: string;
+  /**
+   * Absolute root of what the agent remembers about people and chats, one
+   * JSONL file per subject. Kept away from the workspace for the same reason
+   * as the transcripts.
+   */
+  readonly memoryDir: string;
   /** `null` when credentials are absent — the bot is then simply disabled. */
   readonly lark: LarkConfig | null;
   /** `null` without a DeepSeek API key — messages then get a "not configured" reply. */
@@ -91,6 +97,8 @@ const DEFAULT_DATA_DIR = "data";
 const DEFAULT_WORKSPACE_DIR = "workspace";
 
 const DEFAULT_SESSION_DIR = "sessions";
+
+const DEFAULT_MEMORY_DIR = "memory";
 
 /**
  * Variable names copied into the agent's shell environment.
@@ -288,25 +296,31 @@ const nodeEnv = read("NODE_ENV") ?? "development";
 const dataDir = resolve(read("DATA_DIR") ?? DEFAULT_DATA_DIR);
 const workspaceRoot = resolve(read("WORKSPACE_DIR") ?? DEFAULT_WORKSPACE_DIR);
 const sessionDir = resolve(read("SESSION_DIR") ?? DEFAULT_SESSION_DIR);
+const memoryDir = resolve(read("MEMORY_DIR") ?? DEFAULT_MEMORY_DIR);
 
 /**
- * The three directories must stay disjoint, and for the same reason each time:
- * the agent can write and run shell commands inside its workspace, so anything
- * nested there is something it can rewrite — the instructions it was given, or
- * the record of what it did. Warned about rather than rejected, because an
- * operator may genuinely mean it.
+ * The managed directories must stay disjoint, and for the same reason each
+ * time: the agent can write and run shell commands inside its workspace, so
+ * anything nested there is something it can rewrite — the instructions it was
+ * given, the record of what it did, or what it is supposed to remember. Warned
+ * about rather than rejected, because an operator may genuinely mean it.
  */
-const warnIfOverlapping = (nameA: string, pathA: string, nameB: string, pathB: string): void => {
-  if (overlaps(pathA, pathB)) {
-    configWarnings.push(
-      `${nameA} (${pathA}) overlaps ${nameB} (${pathB}); keep them separate, or the agent can rewrite files it should only ever read`,
-    );
-  }
-};
+const managedDirs = [
+  { name: "DATA_DIR", path: dataDir },
+  { name: "WORKSPACE_DIR", path: workspaceRoot },
+  { name: "SESSION_DIR", path: sessionDir },
+  { name: "MEMORY_DIR", path: memoryDir },
+] as const;
 
-warnIfOverlapping("WORKSPACE_DIR", workspaceRoot, "DATA_DIR", dataDir);
-warnIfOverlapping("SESSION_DIR", sessionDir, "WORKSPACE_DIR", workspaceRoot);
-warnIfOverlapping("SESSION_DIR", sessionDir, "DATA_DIR", dataDir);
+for (const [index, a] of managedDirs.entries()) {
+  for (const b of managedDirs.slice(index + 1)) {
+    if (overlaps(a.path, b.path)) {
+      configWarnings.push(
+        `${a.name} (${a.path}) overlaps ${b.name} (${b.path}); keep them separate, or the agent can rewrite files it should only ever read`,
+      );
+    }
+  }
+}
 
 export const config: AppConfig = {
   port: readInt("PORT", { min: 0, max: 65535, fallback: DEFAULT_PORT }),
@@ -317,6 +331,7 @@ export const config: AppConfig = {
   dataDir,
   workspace: { root: workspaceRoot, shellEnv: resolveShellEnv() },
   sessionDir,
+  memoryDir,
   lark: resolveLark(),
   agent: resolveAgent(),
 };

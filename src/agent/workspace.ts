@@ -17,7 +17,6 @@
  * be pointed at a temporary directory in a test.
  */
 
-import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { resolve, sep } from "node:path";
 
@@ -33,9 +32,7 @@ import {
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 
 import { logger } from "../logger.ts";
-
-/** How much of a chat id survives into the directory name, in characters. */
-const MAX_SLUG_LENGTH = 48;
+import { safeName } from "../safe-name.ts";
 
 export type ChatWorkspace = {
   /**
@@ -75,23 +72,6 @@ const unavailable = (dir: string): ChatWorkspace => ({
   prompt: "",
   cleanup: async () => {},
 });
-
-/**
- * Maps a chat id to a directory name that is safe on any filesystem.
- *
- * The id comes off the transport and must never be trusted as a path segment —
- * `../../etc` would otherwise walk straight out of the root. Everything outside
- * `[A-Za-z0-9_-]` is replaced, which incidentally collapses `..` to `__`.
- *
- * That substitution is lossy, so a digest of the *original* id is appended: two
- * chats whose ids slug to the same string still get separate directories, while
- * the readable prefix keeps `ls` on the root meaningful to a human.
- */
-export const workspaceName = (chatId: string): string => {
-  const slug = chatId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, MAX_SLUG_LENGTH);
-  const digest = createHash("sha256").update(chatId).digest("hex").slice(0, 8);
-  return `${slug === "" ? "chat" : slug}-${digest}`;
-};
 
 /** Tells the model where it is; appended to the session's system prompt. */
 const describeWorkspace = (dir: string): string =>
@@ -162,7 +142,7 @@ export const createWorkspaceProvider = (
   }
 
   const open = (chatId: string): ChatWorkspace => {
-    const dir = resolve(root, workspaceName(chatId));
+    const dir = resolve(root, safeName(chatId));
 
     if (!ready) {
       return unavailable(dir);

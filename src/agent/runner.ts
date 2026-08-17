@@ -30,7 +30,17 @@ import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 
 import type { AgentConfig } from "../config.ts";
 import { logger } from "../logger.ts";
+import { distillTurn } from "./distill.ts";
+import {
+  groupSubject,
+  renderMemoryBlock,
+  userSubject,
+  MEMORY_PROMPT_LIMIT,
+  type MemoryStore,
+} from "./memory.ts";
+import { createMemoryTools, type TurnContext } from "./memory-tools.ts";
 import { PROVIDER_ID, type ModelBinding } from "./model.ts";
+import type { ChatRequest } from "./request.ts";
 import type { ChatTranscript, TranscriptStore } from "./transcript.ts";
 import type { ChatWorkspace, WorkspaceProvider } from "./workspace.ts";
 
@@ -60,7 +70,7 @@ export type AgentReply =
 
 export type AgentRunner = {
   /** Runs one prompt for a chat. Never rejects. */
-  run(chatId: string, prompt: string): Promise<AgentReply>;
+  run(request: ChatRequest, prompt: string): Promise<AgentReply>;
   sessionCount(): number;
   /** Aborts in-flight runs and drops all sessions. */
   clear(): void;
@@ -71,6 +81,13 @@ type Session = {
   readonly agent: Agent;
   readonly workspace: ChatWorkspace;
   readonly transcript: ChatTranscript;
+  /**
+   * Rewritten before each run. The session belongs to a chat, but the speaker
+   * belongs to a message, and the memory tools need the latter.
+   */
+  readonly turn: TurnContext;
+  /** Base prompt for this session — instructions plus workspace, memory aside. */
+  readonly basePrompt: string;
 };
 
 /**
@@ -126,6 +143,7 @@ export const createAgentRunner = (
   binding: ModelBinding,
   workspaces: WorkspaceProvider,
   transcripts: TranscriptStore,
+  memory: MemoryStore,
 ): AgentRunner => {
   const slots = new Map<string, Slot>();
 
@@ -170,24 +188,31 @@ export const createAgentRunner = (
     }
   };
 
-  const openSession = async (chatId: string): Promise<Session> => {
+  const openSession = async (request: ChatRequest): Promise<Session> => {
+    const chatId = request.chatId;
     // Opened before the Agent exists, so the directory is on disk before the
     // model can be told about it, let alone call a tool against it.
     const workspace = workspaces.open(chatId);
     // Keyed on the workspace directory, which is this chat's stable identity.
     const transcript = await transcripts.open(chatId, workspace.dir, MAX_HISTORY_MESSAGES);
 
+    // The workspace block goes after the instructions: it describes where this
+    // session is running, which is the most concrete and least general thing
+    // the model is told, and the only part that differs between chats.
+    const basePrompt =
+      workspace.prompt === ""
+        ? agentConfig.systemPrompt
+        : `${agentConfig.systemPrompt}\n\n${workspace.prompt}`;
+
+    const turn: TurnContext = { request, written: [] };
+
     const agent = new Agent({
       initialState: {
-        // The workspace block goes last: it describes where this session is
-        // running, which is the most concrete and least general instruction the
-        // model has, and it is the only part that differs between chats.
-        systemPrompt:
-          workspace.prompt === ""
-            ? agentConfig.systemPrompt
-            : `${agentConfig.systemPrompt}\n\n${workspace.prompt}`,
+        // Replaced before every run by `composePrompt`, which appends the
+        // memory of whoever is speaking. This is only the starting value.
+        systemPrompt: basePrompt,
         model: binding.model,
-        tools: [...workspace.tools],
+        tools: [...workspace.tools, ...createMemoryTools(memory, () => turn)],
         // What makes this a resumed conversation rather than a new one.
         messages: [...transcript.messages],
       },
@@ -207,12 +232,13 @@ export const createAgentRunner = (
       restoredMessages: transcript.messages.length,
       workspaceDir: workspace.dir,
       workspaceReady: workspace.ready,
-      tools: workspace.tools.map((tool) => tool.name),
+      tools: agent.state.tools.map((tool) => tool.name),
     });
-    return { agent, workspace, transcript };
+    return { agent, workspace, transcript, turn, basePrompt };
   };
 
-  const getSlot = (chatId: string): Slot => {
+  const getSlot = (request: ChatRequest): Slot => {
+    const chatId = request.chatId;
     const now = Date.now();
     evictStaleSlots(now);
 
@@ -229,7 +255,7 @@ export const createAgentRunner = (
     // still reading the transcript joins the same session instead of opening a
     // second one over the same files.
     const created: Slot = {
-      session: openSession(chatId),
+      session: openSession(request),
       lastUsedAt: now,
       tail: Promise.resolve(),
     };
@@ -237,11 +263,66 @@ export const createAgentRunner = (
     return created;
   };
 
+  /**
+   * Builds the system prompt for one turn: the session's fixed part, then who
+   * is speaking and what is remembered about them and about this chat.
+   *
+   * Memory belongs in the system prompt rather than in the user message, for
+   * two reasons. It is instruction, not conversation. And the system prompt is
+   * never written to the transcript, so a snapshot of memory taken today does
+   * not sit in the history forever, being resent long after it went stale.
+   */
+  const composePrompt = async (session: Session, request: ChatRequest): Promise<string> => {
+    const [speakerEntries, chatEntries] = await Promise.all([
+      request.senderOpenId === null
+        ? Promise.resolve([])
+        : memory.recall(userSubject(request.senderOpenId), request, { limit: MEMORY_PROMPT_LIMIT }),
+      memory.recall(groupSubject(request.chatId), request, { limit: MEMORY_PROMPT_LIMIT }),
+    ]);
+
+    const identity = [
+      "<conversation>",
+      request.chatType === "p2p"
+        ? "This is a private chat with one person."
+        : "This is a group chat, and the person speaking can differ from message to message.",
+      request.senderOpenId === null
+        ? "The current message carries no sender open_id, so you cannot record anything about the speaker."
+        : `The current message is from open_id ${request.senderOpenId}.`,
+      "</conversation>",
+    ].join("\n");
+
+    // Empty blocks render as "", so a stranger's first message carries no
+    // memory scaffolding at all.
+    return [
+      session.basePrompt,
+      identity,
+      renderMemoryBlock(
+        "speaker_memory",
+        "What you have recorded about the person speaking now, newest first. Use it; do not recite it back at them.",
+        speakerEntries,
+      ),
+      renderMemoryBlock(
+        "chat_memory",
+        "What you have recorded about this chat, newest first.",
+        chatEntries,
+      ),
+    ]
+      .filter((block) => block !== "")
+      .join("\n\n");
+  };
+
   const execute = async (
     session: Session,
-    chatId: string,
+    request: ChatRequest,
     prompt: string,
   ): Promise<AgentReply> => {
+    const chatId = request.chatId;
+    // Rewritten per run: in a group the speaker changes, and both the memory
+    // tools and the prompt below must follow that rather than the session.
+    session.turn.request = request;
+    session.turn.written = [];
+    session.agent.state.systemPrompt = await composePrompt(session, request);
+
     const startedAt = performance.now();
     // Everything appended from here on belongs to this run: it is both what
     // gets persisted below and how the tool calls are counted.
@@ -317,15 +398,32 @@ export const createAgentRunner = (
         detail: `model returned no text (stopReason: ${last.stopReason})`,
       };
     }
+    // Only a turn that actually answered is worth distilling. Note that a
+    // provider failure does not throw — it comes back as `stopReason: "error"` —
+    // so this has to sit past every check above, or every broken turn would
+    // cost a second model call to mine an exchange that never happened.
+    //
+    // Detached on purpose: it is that second model call, and the user is
+    // waiting. `distillTurn` never rejects, so it cannot surface as an
+    // unhandled rejection.
+    void distillTurn({
+      binding,
+      apiKey: agentConfig.apiKey,
+      request,
+      messages: produced,
+      alreadyRecorded: [...session.turn.written],
+      memory,
+    });
+
     return { ok: true, text };
   };
 
   return {
-    run: async (chatId, prompt) => {
-      const slot = getSlot(chatId);
+    run: async (request, prompt) => {
+      const slot = getSlot(request);
       // Queue behind this chat's previous run. `execute` resolves rather than
       // rejects, so the chain cannot be poisoned by one bad run.
-      const started = slot.tail.then(async () => execute(await slot.session, chatId, prompt));
+      const started = slot.tail.then(async () => execute(await slot.session, request, prompt));
       slot.tail = started.catch(() => undefined);
 
       try {
@@ -333,9 +431,9 @@ export const createAgentRunner = (
       } catch (err) {
         // Only opening the session can land here. Drop the slot so the next
         // message retries instead of inheriting a permanently broken one.
-        slots.delete(chatId);
+        slots.delete(request.chatId);
         logger.error("agent session could not be opened", {
-          chatId,
+          chatId: request.chatId,
           error: describeError(err),
           stack: err instanceof Error ? err.stack : undefined,
         });

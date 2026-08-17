@@ -9,7 +9,9 @@
 import { config } from "../config.ts";
 import { logger } from "../logger.ts";
 import { loadInstructions } from "./instructions.ts";
+import { createMemoryStore } from "./memory.ts";
 import { PROVIDER_ID, resolveModel } from "./model.ts";
+import type { ChatRequest } from "./request.ts";
 import { createAgentRunner, type AgentReply, type AgentRunner } from "./runner.ts";
 import { createTranscriptStore } from "./transcript.ts";
 import { createWorkspaceProvider } from "./workspace.ts";
@@ -86,12 +88,14 @@ export const initAgent = (): void => {
   // Directories under here are created on demand, as each chat's transcript is
   // first written, so there is nothing to prepare or verify at startup.
   const transcripts = createTranscriptStore(config.sessionDir);
+  const memory = createMemoryStore(config.memoryDir);
 
   runner = createAgentRunner(
     { ...agentConfig, systemPrompt: instructions.systemPrompt },
     resolution.binding,
     workspaces,
     transcripts,
+    memory,
   );
   logger.info("agent ready", {
     provider: PROVIDER_ID,
@@ -103,6 +107,7 @@ export const initAgent = (): void => {
     workspaceRoot: config.workspace.root,
     workspaceReady,
     sessionDir: config.sessionDir,
+    memoryDir: config.memoryDir,
   });
 };
 
@@ -123,14 +128,17 @@ export const getAgentStatus = (): AgentStatus => {
  * Runs one prompt for a chat. Never rejects: callers are event handlers that
  * must answer the user rather than propagate a failure into the transport.
  */
-export const runAgent = async (chatId: string, prompt: string): Promise<AgentReply> => {
+export const runAgent = async (
+  request: ChatRequest,
+  prompt: string,
+): Promise<AgentReply> => {
   initAgent();
   if (runner === null || runner === undefined) {
     return config.agent === null
       ? { ok: false, reason: "disabled" }
       : { ok: false, reason: "misconfigured" };
   }
-  return runner.run(chatId, prompt);
+  return runner.run(request, prompt);
 };
 
 /** Drops all sessions; used on shutdown so nothing keeps the process alive. */
