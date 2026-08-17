@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 
+import { getAgentStatus, type AgentStatus } from "./agent/service.ts";
 import { getLarkStatus, type LarkStatus } from "./lark/client.ts";
 import { logger } from "./logger.ts";
 import { requestLogger } from "./request-logger.ts";
@@ -14,6 +15,7 @@ export type HealthReport = {
   uptime: number;
   timestamp: string;
   lark: LarkStatus;
+  agent: AgentStatus;
 };
 
 /**
@@ -46,6 +48,7 @@ app.get("/health", (c) => {
     // connection does not mean this process should be restarted or pulled from
     // a load balancer, and the SDK reconnects on its own.
     lark: getLarkStatus(),
+    agent: getAgentStatus(),
   };
   return c.json(report);
 });

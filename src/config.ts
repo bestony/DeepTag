@@ -27,6 +27,13 @@ export type LarkConfig = {
   readonly domain: LarkDomain;
 };
 
+export type AgentConfig = {
+  readonly apiKey: string;
+  readonly model: string;
+  readonly systemPrompt: string;
+  readonly timeoutMs: number;
+};
+
 export type AppConfig = {
   readonly port: number;
   readonly host: string;
@@ -35,12 +42,25 @@ export type AppConfig = {
   readonly isProduction: boolean;
   /** `null` when credentials are absent — the bot is then simply disabled. */
   readonly lark: LarkConfig | null;
+  /** `null` without a DeepSeek API key — messages then get a "not configured" reply. */
+  readonly agent: AgentConfig | null;
 };
 
 const DEFAULT_PORT = 3000;
 // Loopback by default so a dev server is not exposed to the local network;
 // container deployments set HOST=0.0.0.0 explicitly.
 const DEFAULT_HOST = "127.0.0.1";
+
+export const DEFAULT_AGENT_MODEL = "deepseek-v4-flash";
+
+const DEFAULT_SYSTEM_PROMPT =
+  "You are DeepTag, an assistant replying inside a Lark chat. " +
+  "Answer concisely, in the same language the user writes in. " +
+  "Format replies as short markdown suitable for a chat card.";
+
+// DeepSeek V4 is a reasoning model, so a full answer can take a while; this cap
+// exists to stop a hung request from blocking a chat forever, not to be tight.
+const DEFAULT_AGENT_TIMEOUT_MS = 120_000;
 
 /**
  * Problems found while reading the environment. The logger depends on this
@@ -73,15 +93,21 @@ const read = (name: string): string | undefined => {
 const isLogLevel = (value: string): value is LogLevel =>
   (LOG_LEVELS as readonly string[]).includes(value);
 
-const resolvePort = (): number => {
-  const raw = read("PORT");
+/** Reads an integer variable, warning and falling back when out of range. */
+const readInt = (
+  name: string,
+  bounds: { min: number; max: number; fallback: number },
+): number => {
+  const raw = read(name);
   if (raw === undefined) {
-    return DEFAULT_PORT;
+    return bounds.fallback;
   }
   const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
-    configWarnings.push(`invalid PORT "${raw}", falling back to ${DEFAULT_PORT}`);
-    return DEFAULT_PORT;
+  if (!Number.isInteger(parsed) || parsed < bounds.min || parsed > bounds.max) {
+    configWarnings.push(
+      `invalid ${name} "${raw}", expected an integer in ${bounds.min}-${bounds.max}; falling back to ${bounds.fallback}`,
+    );
+    return bounds.fallback;
   }
   return parsed;
 };
@@ -141,13 +167,36 @@ const resolveLark = (): LarkConfig | null => {
   return { appId, appSecret, domain: resolveLarkDomain() };
 };
 
+/**
+ * The DeepSeek key is what enables the agent. Without it the Lark bot still
+ * receives messages and answers that it is not configured, which is easier to
+ * diagnose than silence.
+ */
+const resolveAgent = (): AgentConfig | null => {
+  const apiKey = read("DEEPSEEK_API_KEY");
+  if (apiKey === undefined) {
+    return null;
+  }
+  return {
+    apiKey,
+    model: read("AGENT_MODEL") ?? DEFAULT_AGENT_MODEL,
+    systemPrompt: read("AGENT_SYSTEM_PROMPT") ?? DEFAULT_SYSTEM_PROMPT,
+    timeoutMs: readInt("AGENT_TIMEOUT_MS", {
+      min: 1_000,
+      max: 600_000,
+      fallback: DEFAULT_AGENT_TIMEOUT_MS,
+    }),
+  };
+};
+
 const nodeEnv = read("NODE_ENV") ?? "development";
 
 export const config: AppConfig = {
-  port: resolvePort(),
+  port: readInt("PORT", { min: 0, max: 65535, fallback: DEFAULT_PORT }),
   host: read("HOST") ?? DEFAULT_HOST,
   logLevel: resolveLogLevel(nodeEnv),
   nodeEnv,
   isProduction: nodeEnv === "production",
   lark: resolveLark(),
+  agent: resolveAgent(),
 };

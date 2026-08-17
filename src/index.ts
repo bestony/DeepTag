@@ -7,6 +7,7 @@
 
 import { serve } from "@hono/node-server";
 
+import { clearAgentSessions, initAgent } from "./agent/service.ts";
 import app from "./app.ts";
 import { config, configWarnings, envFileKeys } from "./config.ts";
 import { startLark, stopLark } from "./lark/client.ts";
@@ -37,6 +38,10 @@ const server = serve({ fetch: app.fetch, port: config.port, hostname: config.hos
   });
 });
 
+// Resolve the model up front so a bad AGENT_MODEL is reported at startup rather
+// than on the first chat message.
+initAgent();
+
 // Not awaited: the HTTP server must start serving immediately rather than wait
 // on a gateway handshake. startLark contains its own failures and never rejects.
 void startLark();
@@ -44,6 +49,7 @@ void startLark();
 const shutdown = (signal: NodeJS.Signals): void => {
   logger.info("shutdown signal received, closing server", { signal });
   stopLark();
+  clearAgentSessions();
   server.close((err) => {
     if (err) {
       logger.error("server failed to close cleanly", { signal, error: err.message });

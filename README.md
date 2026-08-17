@@ -55,12 +55,50 @@ and configure the app in the developer console with:
 Without credentials the HTTP server still starts and only the bot is disabled,
 so a fresh clone runs without holding any secrets.
 
-The bot currently replies to each text message with an interactive card echoing
-the received text. Non-text messages are logged and ignored. Handler code lives
+Each text message is handed to the agent (below) and the answer comes back as an
+interactive card. Non-text messages are logged and ignored. Handler code lives
 in `src/lark/events.ts`; connection lifecycle in `src/lark/client.ts`.
+
+The event handler acknowledges immediately and answers out of band, because the
+gateway redelivers events whose handler does not return promptly and a model
+turn can take tens of seconds.
 
 Note that `pnpm dev` reconnects on every file change, since `node --watch`
 restarts the process.
+
+## Agent
+
+Messages are answered by [`@earendil-works/pi-agent-core`](https://www.npmjs.com/package/@earendil-works/pi-agent-core)
+running on DeepSeek's official API through
+[`@earendil-works/pi-ai`](https://www.npmjs.com/package/@earendil-works/pi-ai).
+Set `DEEPSEEK_API_KEY` to enable it; `AGENT_MODEL` defaults to
+`deepseek-v4-flash`.
+
+| Module                 | Responsibility                                          |
+| ---------------------- | ------------------------------------------------------- |
+| `src/agent/model.ts`   | Registers the DeepSeek provider and resolves the model  |
+| `src/agent/runner.ts`  | Per-chat sessions, serialization, timeouts, pruning     |
+| `src/agent/service.ts` | The app-wide instance wired from configuration          |
+
+pi-ai ships catalogs for many providers, but only DeepSeek is registered: a
+smaller catalog means a smaller failure surface and no unrelated provider SDKs
+loaded at runtime.
+
+**Conversation state.** Each Lark `chat_id` gets its own `Agent`, which owns
+that chat's transcript, so follow-up messages keep context. Three bounds keep
+that from growing without limit:
+
+- at most 200 chats are tracked, evicting the least recently used;
+- a chat idle for an hour starts fresh;
+- at most 60 transcript messages are resent per turn, since every turn resends
+  the history and that is what drives cost.
+
+**Serialization.** Runs for one chat are chained, because a single stateful
+`Agent` driven by two concurrent messages would interleave their transcripts.
+Different chats still run concurrently.
+
+**Tools.** None are registered yet. `pi-agent-core` supports tool calling, and
+tools belong in the `initialState.tools` array in `src/agent/runner.ts`.
 
 ### Configuration
 
@@ -79,6 +117,10 @@ every variable is optional.
 | `LARK_APP_ID` | –                            | Lark app id; must be set together with the secret    |
 | `LARK_APP_SECRET` | –                        | Lark app secret; unset disables the bot              |
 | `LARK_DOMAIN` | `feishu`                     | `feishu` (mainland China) or `lark` (international)  |
+| `DEEPSEEK_API_KEY` | –                       | Enables the agent; unset makes it answer "not configured" |
+| `AGENT_MODEL` | `deepseek-v4-flash`          | `deepseek-v4-flash` or `deepseek-v4-pro`             |
+| `AGENT_SYSTEM_PROMPT` | built-in             | System prompt handed to the agent                    |
+| `AGENT_TIMEOUT_MS` | `120000`                | Backstop before an in-flight turn is aborted         |
 
 Invalid values are reported as a `configuration problem` warning and fall back
 to the default rather than aborting startup. All parsing lives in
