@@ -10,7 +10,7 @@
  * reintroduce exactly that ordering hazard.
  */
 
-import { resolve } from "node:path";
+import { resolve, sep } from "node:path";
 
 import { config as loadDotenv } from "dotenv";
 
@@ -36,6 +36,19 @@ export type AgentConfig = {
   readonly timeoutMs: number;
 };
 
+export type WorkspaceConfig = {
+  /**
+   * Absolute root of all workspaces. Each chat works in its own directory
+   * beneath it; the root itself holds no files of its own.
+   */
+  readonly root: string;
+  /**
+   * Environment handed to shell commands the agent runs. See
+   * SHELL_ENV_ALLOWLIST — this is built by allowlist, not by filtering.
+   */
+  readonly shellEnv: Readonly<Record<string, string>>;
+};
+
 export type AppConfig = {
   readonly port: number;
   readonly host: string;
@@ -49,6 +62,8 @@ export type AppConfig = {
    * a deployment happens to start in. The directory need not exist.
    */
   readonly dataDir: string;
+  /** Where agent sessions do their work; see WORKSPACE_DIR. */
+  readonly workspace: WorkspaceConfig;
   /** `null` when credentials are absent — the bot is then simply disabled. */
   readonly lark: LarkConfig | null;
   /** `null` without a DeepSeek API key — messages then get a "not configured" reply. */
@@ -63,6 +78,42 @@ const DEFAULT_HOST = "127.0.0.1";
 // Relative to the working directory, which for every documented way of starting
 // the server is the project root.
 const DEFAULT_DATA_DIR = "data";
+
+// A sibling of DATA_DIR rather than a directory inside it, and deliberately so:
+// the agent can write and run shell commands in its workspace, so nesting the
+// two would let it rewrite its own AGENTS.md. Overlap is warned about below.
+const DEFAULT_WORKSPACE_DIR = "workspace";
+
+/**
+ * Variable names copied into the agent's shell environment.
+ *
+ * An allowlist, not a filtered copy of this process's environment: DEEPSEEK_API_KEY
+ * and the Lark credentials live here, and `env` is one command away from
+ * printing them into a chat. Building up rather than tearing down means a
+ * secret added to `.env` later is excluded because nobody thought about it,
+ * which is the only way this stays safe over time.
+ *
+ * Adding a name here deliberately exposes that variable to the model.
+ */
+const SHELL_ENV_ALLOWLIST = [
+  // Without PATH the shell resolves almost nothing.
+  "PATH",
+  "HOME",
+  "SHELL",
+  "USER",
+  "LOGNAME",
+  "LANG",
+  "LC_ALL",
+  "TZ",
+  "TMPDIR",
+  // Windows equivalents; absent names are simply skipped elsewhere.
+  "SystemRoot",
+  "ComSpec",
+  "PATHEXT",
+  "USERPROFILE",
+  "TEMP",
+  "TMP",
+] as const;
 
 export const DEFAULT_AGENT_MODEL = "deepseek-v4-flash";
 
@@ -202,7 +253,41 @@ const resolveAgent = (): AgentConfig | null => {
   };
 };
 
+/**
+ * Copies the allowlisted variables. Values are taken verbatim — unlike `read`,
+ * which trims and treats blank as unset, since a variable's exact value is what
+ * a shell command expects to see.
+ */
+const resolveShellEnv = (): Record<string, string> => {
+  const shellEnv: Record<string, string> = {};
+  for (const name of SHELL_ENV_ALLOWLIST) {
+    const value = process.env[name];
+    if (value !== undefined) {
+      shellEnv[name] = value;
+    }
+  }
+  return shellEnv;
+};
+
+/** True when one path is the other, or is nested inside it. */
+const overlaps = (a: string, b: string): boolean =>
+  a === b || a.startsWith(b + sep) || b.startsWith(a + sep);
+
 const nodeEnv = read("NODE_ENV") ?? "development";
+
+// `resolve` leaves an absolute value untouched and anchors a relative one to the
+// working directory.
+const dataDir = resolve(read("DATA_DIR") ?? DEFAULT_DATA_DIR);
+const workspaceRoot = resolve(read("WORKSPACE_DIR") ?? DEFAULT_WORKSPACE_DIR);
+
+// Not fatal — an operator may well mean it — but worth saying out loud, because
+// the agent has write and shell access to its workspace and would then be able
+// to edit the very instructions it is given.
+if (overlaps(dataDir, workspaceRoot)) {
+  configWarnings.push(
+    `WORKSPACE_DIR (${workspaceRoot}) overlaps DATA_DIR (${dataDir}); the agent can then rewrite its own AGENTS.md and MEMORY.md`,
+  );
+}
 
 export const config: AppConfig = {
   port: readInt("PORT", { min: 0, max: 65535, fallback: DEFAULT_PORT }),
@@ -210,9 +295,8 @@ export const config: AppConfig = {
   logLevel: resolveLogLevel(nodeEnv),
   nodeEnv,
   isProduction: nodeEnv === "production",
-  // `resolve` leaves an absolute DATA_DIR untouched and anchors a relative one
-  // to the working directory.
-  dataDir: resolve(read("DATA_DIR") ?? DEFAULT_DATA_DIR),
+  dataDir,
+  workspace: { root: workspaceRoot, shellEnv: resolveShellEnv() },
   lark: resolveLark(),
   agent: resolveAgent(),
 };

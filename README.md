@@ -34,7 +34,7 @@ curl http://127.0.0.1:3000/health
 # {"status":"ok","service":"deeptag","uptime":12.34,"timestamp":"...",
 #  "lark":{"enabled":true,"state":"connected","reconnectAttempts":0},
 #  "agent":{"enabled":true,"model":"deepseek-v4-flash","sessions":0,
-#           "instructionFiles":["AGENTS.md"]}}
+#           "instructionFiles":["AGENTS.md"],"workspaceReady":true}}
 ```
 
 `lark.state` is reported but deliberately kept out of `status`: a degraded bot
@@ -86,6 +86,7 @@ Set `DEEPSEEK_API_KEY` to enable it; `AGENT_MODEL` defaults to
 | --------------------------- | ------------------------------------------------------- |
 | `src/agent/model.ts`        | Registers the DeepSeek provider and resolves the model  |
 | `src/agent/instructions.ts` | Builds the system prompt from `DATA_DIR`                |
+| `src/agent/workspace.ts`    | Per-chat workspaces and the tools bound to them         |
 | `src/agent/runner.ts`       | Per-chat sessions, serialization, timeouts, pruning     |
 | `src/agent/service.ts`      | The app-wide instance wired from configuration          |
 
@@ -106,8 +107,54 @@ that from growing without limit:
 `Agent` driven by two concurrent messages would interleave their transcripts.
 Different chats still run concurrently.
 
-**Tools.** None are registered yet. `pi-agent-core` supports tool calling, and
-tools belong in the `initialState.tools` array in `src/agent/runner.ts`.
+**Tools.** Each session gets `read`, `write`, `edit` and `bash`, bound to that
+chat's workspace — see below.
+
+### Workspace
+
+Every session runs in a workspace: a directory the agent works in, and the file
+and shell tools rooted there. `WORKSPACE_DIR` (default `./workspace`) is the
+root, and each chat gets its own directory beneath it:
+
+```
+workspace/                    # WORKSPACE_DIR
+├── oc_9a3f1c...-4e91b0d2/    # one chat
+│   └── report.md
+└── oc_71bd88...-c07af5e3/    # another
+    └── notes.txt
+```
+
+One workspace per chat rather than one shared by all: a shared directory lets
+one conversation read and overwrite another's files, which for a bot sitting in
+a company's group chats is a confidentiality problem, not just an untidy one.
+
+The directory is created when the session starts — before the model is told
+about it, let alone able to call a tool — and the absolute path is named in the
+system prompt so the model knows where it is. Relative paths in `read`, `write`,
+`edit` and `bash` resolve against it.
+
+Directory names are `<slug>-<digest>`: the chat id with everything outside
+`[A-Za-z0-9_-]` replaced, truncated, plus 8 hex characters of its SHA-256. The
+id arrives from the transport and is never used as a path segment directly —
+`../../etc` would walk out of the root — while the digest keeps two ids that
+slug alike from colliding and the readable prefix keeps `ls` useful.
+
+**Directories outlive sessions.** A chat evicted from the session registry, or
+idle past the TTL, keeps its files; only the transcript is dropped. Nothing
+deletes a workspace, so growth on disk is yours to manage.
+
+**Shell access is not sandboxed.** `bash` runs commands as the server process
+with the workspace as its working directory, and `cd` or an absolute path leaves
+it at will. Run DeepTag in a container if that matters to you. The shell
+environment is *not* inherited from the server process: it is built from an
+allowlist in `src/config.ts` (`PATH`, `HOME`, `LANG`, …), because the process
+environment holds `DEEPSEEK_API_KEY` and the Lark credentials and `env` would
+otherwise print them into the chat. Adding a name to that list deliberately
+exposes that variable to the model.
+
+Keep `WORKSPACE_DIR` outside `DATA_DIR`. The agent can write and run commands in
+its workspace, so a nested layout lets it rewrite the `AGENTS.md` it was given;
+overlapping paths are reported as a `configuration problem` at startup.
 
 ### System prompt and the data directory
 
@@ -166,6 +213,7 @@ every variable is optional.
 | `LOG_LEVEL` | `debug` (`info` in production) | One of `debug`, `info`, `warn`, `error`, `silent`    |
 | `NODE_ENV`  | `development`                  | `production` narrows the default log level to `info` |
 | `DATA_DIR`  | `./data`                       | Holds `AGENTS.md` and `MEMORY.md`; need not exist    |
+| `WORKSPACE_DIR` | `./workspace`              | Root of the per-chat workspaces; created at startup  |
 | `LARK_APP_ID` | –                            | Lark app id; must be set together with the secret    |
 | `LARK_APP_SECRET` | –                        | Lark app secret; unset disables the bot              |
 | `LARK_DOMAIN` | `feishu`                     | `feishu` (mainland China) or `lark` (international)  |

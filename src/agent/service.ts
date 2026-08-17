@@ -11,6 +11,7 @@ import { logger } from "../logger.ts";
 import { loadInstructions } from "./instructions.ts";
 import { PROVIDER_ID, resolveModel } from "./model.ts";
 import { createAgentRunner, type AgentReply, type AgentRunner } from "./runner.ts";
+import { createWorkspaceProvider } from "./workspace.ts";
 
 export type AgentStatus =
   | { readonly enabled: false }
@@ -24,6 +25,12 @@ export type AgentStatus =
        * without reading the process's logs.
        */
       readonly instructionFiles: readonly string[];
+      /**
+       * False when WORKSPACE_DIR could not be created; sessions then run
+       * without file or shell tools. The path itself stays out of the response
+       * and in the startup log.
+       */
+      readonly workspaceReady: boolean;
     };
 
 /** `undefined` = not resolved yet, `null` = resolution attempted and failed. */
@@ -31,6 +38,9 @@ let runner: AgentRunner | null | undefined;
 
 /** Files from DATA_DIR that contributed to the prompt, captured at init. */
 let instructionFiles: readonly string[] = [];
+
+/** Whether the workspace root was usable at init. */
+let workspaceReady = false;
 
 /**
  * Resolves the model once. Call at startup so a bad AGENT_MODEL is reported
@@ -66,9 +76,16 @@ export const initAgent = (): void => {
   const instructions = loadInstructions(config.dataDir, agentConfig.systemPrompt);
   instructionFiles = instructions.loaded;
 
+  // One provider for the whole process; it creates the root now so a bad
+  // WORKSPACE_DIR is reported at startup, and a per-chat directory beneath it
+  // as each session starts.
+  const workspaces = createWorkspaceProvider(config.workspace.root, config.workspace.shellEnv);
+  workspaceReady = workspaces.ready;
+
   runner = createAgentRunner(
     { ...agentConfig, systemPrompt: instructions.systemPrompt },
     resolution.binding,
+    workspaces,
   );
   logger.info("agent ready", {
     provider: PROVIDER_ID,
@@ -77,6 +94,8 @@ export const initAgent = (): void => {
     timeoutMs: agentConfig.timeoutMs,
     dataDir: config.dataDir,
     instructionFiles,
+    workspaceRoot: config.workspace.root,
+    workspaceReady,
   });
 };
 
@@ -89,6 +108,7 @@ export const getAgentStatus = (): AgentStatus => {
     model: config.agent.model,
     sessions: runner.sessionCount(),
     instructionFiles,
+    workspaceReady,
   };
 };
 

@@ -10,9 +10,14 @@
  * - runs for one chat must be serialized, because driving a single stateful
  *   Agent from two concurrent messages interleaves their transcripts.
  *
- * The runner takes its model binding as an argument rather than reading config,
- * so it can be exercised against a faux provider. `service.ts` wires the
- * application-wide instance.
+ * A session also owns a workspace — the directory it works in, and the file and
+ * shell tools bound to it. Both are opened when the session is created, which
+ * is what "the agent starts in its workspace" means in practice: no session
+ * exists without one, and no tool can be called before the directory is there.
+ *
+ * The runner takes its model binding and workspace provider as arguments rather
+ * than reading config, so it can be exercised against a faux provider and a
+ * temporary directory. `service.ts` wires the application-wide instance.
  */
 
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
@@ -20,6 +25,7 @@ import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AgentConfig } from "../config.ts";
 import { logger } from "../logger.ts";
 import { PROVIDER_ID, type ModelBinding } from "./model.ts";
+import type { ChatWorkspace, WorkspaceProvider } from "./workspace.ts";
 
 /** Chats tracked at once; the least recently used is dropped beyond this. */
 const MAX_SESSIONS = 200;
@@ -53,6 +59,7 @@ export type AgentRunner = {
 
 type Session = {
   readonly agent: Agent;
+  readonly workspace: ChatWorkspace;
   lastUsedAt: number;
   /** Tail of this chat's run chain; see the serialization note above. */
   tail: Promise<unknown>;
@@ -88,26 +95,39 @@ const extractText = (message: AgentMessage): string => {
 export const createAgentRunner = (
   agentConfig: AgentConfig,
   binding: ModelBinding,
+  workspaces: WorkspaceProvider,
 ): AgentRunner => {
   const sessions = new Map<string, Session>();
+
+  /**
+   * Drops a session and releases its workspace. The directory itself stays on
+   * disk — only the transcript and any processes the shell tool left running
+   * are discarded.
+   */
+  const dropSession = (chatId: string, session: Session): void => {
+    sessions.delete(chatId);
+    session.agent.abort();
+    void session.workspace.cleanup();
+  };
 
   const evictStaleSessions = (now: number): void => {
     for (const [chatId, session] of sessions) {
       if (now - session.lastUsedAt > SESSION_TTL_MS) {
-        sessions.delete(chatId);
+        dropSession(chatId, session);
         logger.debug("agent session expired", { chatId });
       }
     }
     // Map iterates in insertion order and every use re-inserts, so the first
     // key is the least recently used.
     while (sessions.size > MAX_SESSIONS) {
-      const oldest = sessions.keys().next();
+      const oldest = sessions.entries().next();
       if (oldest.done === true) {
         break;
       }
-      sessions.delete(oldest.value);
+      const [chatId, session] = oldest.value;
+      dropSession(chatId, session);
       logger.debug("agent session evicted, session limit reached", {
-        chatId: oldest.value,
+        chatId,
         limit: MAX_SESSIONS,
       });
     }
@@ -126,12 +146,21 @@ export const createAgentRunner = (
       return existing;
     }
 
+    // Opened before the Agent exists, so the directory is on disk before the
+    // model can be told about it, let alone call a tool against it.
+    const workspace = workspaces.open(chatId);
+
     const agent = new Agent({
       initialState: {
-        systemPrompt: agentConfig.systemPrompt,
+        // The workspace block goes last: it describes where this session is
+        // running, which is the most concrete and least general instruction the
+        // model has, and it is the only part that differs between chats.
+        systemPrompt:
+          workspace.prompt === ""
+            ? agentConfig.systemPrompt
+            : `${agentConfig.systemPrompt}\n\n${workspace.prompt}`,
         model: binding.model,
-        // No tools yet; the loop supports them, and they belong here when added.
-        tools: [],
+        tools: [...workspace.tools],
       },
       streamFn: binding.models.streamSimple.bind(binding.models),
       transformContext: async (messages) => pruneHistory(messages),
@@ -142,9 +171,14 @@ export const createAgentRunner = (
       sessionId: chatId,
     });
 
-    const created: Session = { agent, lastUsedAt: now, tail: Promise.resolve() };
+    const created: Session = { agent, workspace, lastUsedAt: now, tail: Promise.resolve() };
     sessions.set(chatId, created);
-    logger.debug("agent session created", { chatId, sessions: sessions.size });
+    logger.debug("agent session created", {
+      chatId,
+      sessions: sessions.size,
+      workspaceDir: workspace.dir,
+      tools: workspace.tools.map((tool) => tool.name),
+    });
     return created;
   };
 
@@ -154,6 +188,9 @@ export const createAgentRunner = (
     prompt: string,
   ): Promise<AgentReply> => {
     const startedAt = performance.now();
+    // Everything appended from here on belongs to this run, which is how the
+    // tool calls below are counted.
+    const messagesBefore = session.agent.state.messages.length;
     // abort() rather than racing a rejection: it also stops the provider stream.
     const timer = setTimeout(() => session.agent.abort(), agentConfig.timeoutMs);
 
@@ -187,6 +224,12 @@ export const createAgentRunner = (
       model: last.model,
       stopReason: last.stopReason,
       durationMs,
+      workspaceDir: session.workspace.dir,
+      // A turn that used tools takes several model round-trips, so this is the
+      // first thing to look at when a run is slow or hits the timeout.
+      toolCalls: session.agent.state.messages
+        .slice(messagesBefore)
+        .filter((message) => message.role === "toolResult").length,
       inputTokens: last.usage.input,
       outputTokens: last.usage.output,
       reasoningTokens: last.usage.reasoning,
@@ -224,10 +267,9 @@ export const createAgentRunner = (
     },
     sessionCount: () => sessions.size,
     clear: () => {
-      for (const session of sessions.values()) {
-        session.agent.abort();
+      for (const [chatId, session] of sessions) {
+        dropSession(chatId, session);
       }
-      sessions.clear();
     },
   };
 };

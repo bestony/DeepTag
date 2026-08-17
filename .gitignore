@@ -141,3 +141,7 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Agent workspaces (WORKSPACE_DIR): files the agent creates while working,
+# one directory per chat. Runtime output, never source.
+/workspace/
