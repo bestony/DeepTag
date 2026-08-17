@@ -1,0 +1,24 @@
+# Git hooks managed by lefthook — https://lefthook.dev
+#
+# Hooks are installed by `pnpm install` (lefthook postinstall) or manually via
+# `pnpm lefthook install`. Run a hook on demand with `pnpm lefthook run pre-commit`.
+# Set LEFTHOOK=0 to bypass all hooks for a single command.
+
+pre-commit:
+  parallel: true
+  # Hooks would fight with conflict resolution during merge/rebase.
+  skip:
+    - merge
+    - rebase
+  jobs:
+    - name: typecheck
+      # Only pay for the check when TypeScript sources or the config changed.
+      glob:
+        - "*.ts"
+        - "*.tsx"
+        - "*.mts"
+        - "*.cts"
+        - "tsconfig.json"
+      # Type errors are project-wide, so check the whole project rather than the
+      # staged files in isolation: {staged_files} would miss cross-file breakage.
+      run: pnpm run typecheck
