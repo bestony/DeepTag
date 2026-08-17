@@ -9,6 +9,7 @@ import { serve } from "@hono/node-server";
 
 import app from "./app.ts";
 import { config, configWarnings, envFileKeys } from "./config.ts";
+import { startLark, stopLark } from "./lark/client.ts";
 import { logger } from "./logger.ts";
 
 // Config is parsed before the logger exists, so its complaints are replayed
@@ -36,8 +37,13 @@ const server = serve({ fetch: app.fetch, port: config.port, hostname: config.hos
   });
 });
 
+// Not awaited: the HTTP server must start serving immediately rather than wait
+// on a gateway handshake. startLark contains its own failures and never rejects.
+void startLark();
+
 const shutdown = (signal: NodeJS.Signals): void => {
   logger.info("shutdown signal received, closing server", { signal });
+  stopLark();
   server.close((err) => {
     if (err) {
       logger.error("server failed to close cleanly", { signal, error: err.message });

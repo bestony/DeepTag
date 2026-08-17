@@ -16,12 +16,25 @@ export const LOG_LEVELS = ["debug", "info", "warn", "error", "silent"] as const;
 
 export type LogLevel = (typeof LOG_LEVELS)[number];
 
+/** `feishu` is the mainland China deployment, `lark` the international one. */
+export const LARK_DOMAINS = ["feishu", "lark"] as const;
+
+export type LarkDomain = (typeof LARK_DOMAINS)[number];
+
+export type LarkConfig = {
+  readonly appId: string;
+  readonly appSecret: string;
+  readonly domain: LarkDomain;
+};
+
 export type AppConfig = {
   readonly port: number;
   readonly host: string;
   readonly logLevel: LogLevel;
   readonly nodeEnv: string;
   readonly isProduction: boolean;
+  /** `null` when credentials are absent — the bot is then simply disabled. */
+  readonly lark: LarkConfig | null;
 };
 
 const DEFAULT_PORT = 3000;
@@ -87,6 +100,47 @@ const resolveLogLevel = (nodeEnv: string): LogLevel => {
   return "info";
 };
 
+const isLarkDomain = (value: string): value is LarkDomain =>
+  (LARK_DOMAINS as readonly string[]).includes(value);
+
+const resolveLarkDomain = (): LarkDomain => {
+  const raw = read("LARK_DOMAIN")?.toLowerCase();
+  if (raw === undefined) {
+    return "feishu";
+  }
+  if (isLarkDomain(raw)) {
+    return raw;
+  }
+  configWarnings.push(
+    `unknown LARK_DOMAIN "${raw}", expected one of ${LARK_DOMAINS.join(", ")}; falling back to "feishu"`,
+  );
+  return "feishu";
+};
+
+/**
+ * Credentials are optional. Without them the HTTP server still starts and only
+ * the Lark bot stays disabled, so a fresh clone can run `pnpm dev` and hit
+ * /health without holding any secrets.
+ */
+const resolveLark = (): LarkConfig | null => {
+  const appId = read("LARK_APP_ID");
+  const appSecret = read("LARK_APP_SECRET");
+
+  if (appId === undefined && appSecret === undefined) {
+    return null;
+  }
+  // Half-configured is a mistake worth naming: silently disabling the bot when
+  // one of the pair is set would look like the credentials were simply wrong.
+  if (appId === undefined || appSecret === undefined) {
+    const missing = appId === undefined ? "LARK_APP_ID" : "LARK_APP_SECRET";
+    configWarnings.push(
+      `${missing} is missing; LARK_APP_ID and LARK_APP_SECRET must be set together, so the Lark client stays disabled`,
+    );
+    return null;
+  }
+  return { appId, appSecret, domain: resolveLarkDomain() };
+};
+
 const nodeEnv = read("NODE_ENV") ?? "development";
 
 export const config: AppConfig = {
@@ -95,4 +149,5 @@ export const config: AppConfig = {
   logLevel: resolveLogLevel(nodeEnv),
   nodeEnv,
   isProduction: nodeEnv === "production",
+  lark: resolveLark(),
 };

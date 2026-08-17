@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 
+import { getLarkStatus, type LarkStatus } from "./lark/client.ts";
 import { logger } from "./logger.ts";
 import { requestLogger } from "./request-logger.ts";
 
@@ -12,6 +13,7 @@ export type HealthReport = {
   /** Seconds since this process started. */
   uptime: number;
   timestamp: string;
+  lark: LarkStatus;
 };
 
 /**
@@ -40,6 +42,10 @@ app.get("/health", (c) => {
     service: SERVICE_NAME,
     uptime: Math.round(process.uptime() * 1000) / 1000,
     timestamp: new Date().toISOString(),
+    // Reported, but deliberately not folded into `status`: a degraded Lark
+    // connection does not mean this process should be restarted or pulled from
+    // a load balancer, and the SDK reconnects on its own.
+    lark: getLarkStatus(),
   };
   return c.json(report);
 });

@@ -1,2 +1,7 @@
 allowBuilds:
+  # Installs the git hooks (see lefthook.yml).
   lefthook: true
+  # Transitive dep of @larksuiteoapi/node-sdk. Its postinstall only sets up the
+  # protobufjs CLI; the Lark WebSocket client works without it, so the script
+  # stays denied rather than run for nothing.
+  protobufjs: false
